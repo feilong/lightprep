@@ -15,6 +15,12 @@ failing in a way that reads as a lightprep bug rather than a missing dependency.
 
 If neither is usable it raises `DependencyError` saying so.
 
+This holds for an installed lightprep too, where "beside the package" means the
+`lightprep/` directory inside `site-packages`. Wheels deliberately do **not**
+carry a binary — they are tagged `py3-none-any`, and shipping a platform-specific
+executable inside one would be wrong on every other platform — so an installed
+lightprep normally finds niimath on PATH.
+
 ## What version
 
 A build recent enough to carry **`-moco`**, **`--medic`** and **`-unwarp`**.

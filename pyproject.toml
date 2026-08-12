@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lightprep"
+description = "lightNIIng-based preprocessing workflows"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Feilong Ma", email = "mafeilong@gmail.com" }]
+# The step registries annotate `get_method(name: str | None = None)` without
+# `from __future__ import annotations`, so the union is evaluated at runtime.
+requires-python = ">=3.10"
+dynamic = ["version"]
+keywords = ["fMRI", "neuroimaging", "preprocessing", "multi-echo", "niimath"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+# niimath is deliberately absent: it is an external program, found beside the
+# package or on PATH at runtime, not a Python dependency. See BUILD.md.
+dependencies = [
+    "numpy",
+    "nibabel",
+    "scipy",
+    # Imported lazily, but by the default coregistration method and by every
+    # surface module, so it is not really optional.
+    "nitransforms",
+]
+
+[project.optional-dependencies]
+# lightprep.glm builds its design matrices and fits with nilearn.
+glm = ["nilearn"]
+# The reference MEDIC implementation, for lightprep.sdc.medic. The niimath
+# method (lightprep.sdc.medic_niimath, the default) needs none of this.
+warpkit = ["warpkit"]
+all = ["lightprep[glm,warpkit]"]
+
+[project.urls]
+Homepage = "https://github.com/feilong/lightprep"
+Source = "https://github.com/feilong/lightprep"
+
+[tool.hatch.version]
+path = "lightprep/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lightprep"]
+# A niimath build sitting in the source tree must not end up in a wheel: it is
+# platform-specific, and the wheel is tagged py3-none-any. An installed
+# lightprep finds niimath on PATH (or you may drop a build into the installed
+# package directory yourself).
+exclude = ["niimath"]
+
+[tool.hatch.build.targets.sdist]
+include = ["lightprep", "BUILD.md", "README.md", "LICENSE"]
+exclude = ["lightprep/niimath"]
