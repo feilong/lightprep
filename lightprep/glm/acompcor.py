@@ -5,10 +5,10 @@ that carries no signal of interest, so its dominant temporal patterns are
 physiological and scanner noise shared with grey matter.
 
 The noise ROI is built the way fMRIPrep builds it: take the grey-matter mask,
-*dilate* it, and subtract that from the WM and CSF masks. Any voxel within one
-dilation step of grey matter is dropped, so partial-volume BOLD never enters the
-ROI. This is done in the functional grid, at 2.8 mm, where a single-voxel
-dilation already clears a wide margin.
+grow it, and subtract that from the WM and CSF masks, so partial-volume BOLD
+never enters the ROI. The margin is specified in millimetres and measured with
+an exact Euclidean distance transform, rather than as voxel dilation steps --
+see :func:`noise_roi` for why the two are not interchangeable.
 
 The masks come from FreeSurfer's aparc+aseg, resampled into the functional space
 through the coregistration, nearest-neighbour so labels stay intact.
@@ -70,20 +70,58 @@ def _resample_labels_to_func(aseg_path, func_img, coreg_lta):
     return out.reshape(shape)
 
 
-def noise_roi(aseg_path, func_img, coreg_lta, *, gm_dilation=1):
+def noise_roi(aseg_path, func_img, coreg_lta, *, gm_margin_mm=3.0, gm_dilation=None):
     """WM+CSF noise ROI on the functional grid, GM-adjacent voxels removed.
 
-    Returns ``(roi, wm, csf, gm_dilated)`` boolean volumes for inspection.
+    The margin is a true Euclidean distance in millimetres, measured with an
+    exact distance transform that is told the voxel sizes. That is what the
+    requirement is actually stated in -- "no voxel within 3mm of grey matter" --
+    and it holds in every direction and at any resolution.
+
+    Binary dilation cannot express that. ``ndimage.binary_dilation`` uses a
+    6-connected element, so ``iterations=n`` grows the mask by n *taxicab*
+    steps: at 2mm isotropic, ``n=1`` clears 2mm along an axis but leaves the
+    nearest surviving voxel on a diagonal only 2.83mm away, and ``n=2`` clears
+    4mm along an axis for a true minimum of 3.46mm. The guarantee is anisotropic,
+    quantised to the voxel, and changes meaning with resolution.
+
+    Args:
+        aseg_path: FreeSurfer ``aparc+aseg.mgz``.
+        func_img: The functional image whose grid the ROI is built on.
+        coreg_lta: FreeSurfer LTA from the functional reference to the anatomy.
+        gm_margin_mm: Minimum Euclidean distance, in mm, that a retained voxel
+            must be from the nearest grey-matter voxel.
+        gm_dilation: Legacy taxicab dilation in voxels. If given it overrides
+            ``gm_margin_mm`` and reproduces the old behaviour exactly.
+
+    Returns:
+        ``(roi, wm, csf, gm_excluded)`` boolean volumes for inspection, where
+        ``gm_excluded`` is the region the margin removed.
     """
     labels = _resample_labels_to_func(aseg_path, func_img, coreg_lta)
     gm, wm, csf = _tissue_masks(labels)
 
-    if gm_dilation < 1:
-        raise ValueError("gm_dilation must be >= 1 (scipy treats 0 as dilate-to-convergence)")
-    gm_dil = ndimage.binary_dilation(gm, iterations=gm_dilation)
-    wm_roi = wm & ~gm_dil
-    csf_roi = csf & ~gm_dil
-    return (wm_roi | csf_roi), wm_roi, csf_roi, gm_dil
+    if gm_dilation is not None:
+        if gm_dilation < 1:
+            raise ValueError(
+                "gm_dilation must be >= 1 (scipy treats 0 as dilate-to-convergence)")
+        gm_excluded = ndimage.binary_dilation(gm, iterations=gm_dilation)
+    else:
+        if gm_margin_mm < 0:
+            raise ValueError(f"gm_margin_mm must be >= 0, got {gm_margin_mm}")
+        if not gm.any():
+            raise ValueError("no grey matter in the resampled labels; check the "
+                             "coregistration and that aseg covers the functional FOV")
+        # Distance from every voxel to the nearest grey-matter voxel, in mm.
+        # `sampling` is what makes it millimetres rather than voxels, and keeps
+        # this correct on anisotropic grids.
+        zooms = func_img.header.get_zooms()[:3]
+        distance_mm = ndimage.distance_transform_edt(~gm, sampling=zooms)
+        gm_excluded = distance_mm < gm_margin_mm
+
+    wm_roi = wm & ~gm_excluded
+    csf_roi = csf & ~gm_excluded
+    return (wm_roi | csf_roi), wm_roi, csf_roi, gm_excluded
 
 
 def _detrend_and_normalise(ts, order=2):
