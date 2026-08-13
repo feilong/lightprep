@@ -7,7 +7,10 @@ MEDIC is the multi-echo method: it reads the field off the phase of the data
 itself, per frame. Two implementations of it are registered -- :func:`medic`,
 which calls warpkit, and :func:`medic_niimath`, which calls niimath.
 :func:`phasediff` is the static, fieldmap-based alternative, for runs with no
-usable phase.
+usable phase. :func:`pepolar` is the other static one, for the common case of a
+single-echo run whose only fieldmap is a reversed-phase-encoding EPI: it needs
+no phase at all, recovering the field from the blip-up/blip-down pair with FSL
+``topup``.
 
 The default is :func:`medic_niimath`: it needs nothing installed and takes 21
 seconds on the pilot's 138-frame run where warpkit takes minutes, and the two
@@ -27,12 +30,14 @@ register it in :data:`METHODS`.
 from .base import SDCResult
 from .medic import MIN_ECHOES, medic
 from .niimath import medic as medic_niimath
+from .pepolar import pepolar
 from .phasediff import phasediff
 
 #: Method name -> callable. Extend this as methods are added.
 METHODS = {
     "medic": medic,
     "niimath": medic_niimath,
+    "pepolar": pepolar,
     "phasediff": phasediff,
 }
 
@@ -55,5 +60,5 @@ def get_method(name: str | None = None):
         ) from None
 
 
-__all__ = ["SDCResult", "medic", "medic_niimath", "phasediff", "MIN_ECHOES",
-           "METHODS", "DEFAULT_METHOD", "get_method"]
+__all__ = ["SDCResult", "medic", "medic_niimath", "pepolar", "phasediff",
+           "MIN_ECHOES", "METHODS", "DEFAULT_METHOD", "get_method"]
