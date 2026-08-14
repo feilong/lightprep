@@ -26,13 +26,17 @@ STATION_TO_SCANNER = {"AWP177514": "Vida", "AWP237021": "TerraX"}
 #: against 0.66 between). `ses-TerraX260605T1307` (`CR_test04`) is absent on
 #: purpose: it has no MP2RAGE, so nothing has verified it.
 RESOLVED_SESSION = {
-    # pilot 3T Vida, PatientName `Ro`
-    "ses-Vida260702T1603": "CR",
+    # pilot 3T Vida, PatientName `Ro` -- brain shape (EP3d magnitude, r 0.92-0.95)
     "ses-Vida260707T1241": "CR",
     "ses-Vida260708T1251": "CR",
-    "ses-Vida260708T1401": "CR",
     "ses-Vida260709T0907": "CR",
-    # pilot 7T Terra.X, PatientName `crtest`
+    # --- provenance, NOT anatomy: these three have no structural at all. They
+    # are CR by PatientName plus archive identity (the 260702 Vida archive is
+    # byte-identical to the 7T project's sub-CR session, which pairs the two
+    # 260702 scans). Weaker than the rows above; an EPI-to-EPI check would
+    # settle them, since all three have func.
+    "ses-Vida260702T1603": "CR",
+    "ses-Vida260708T1401": "CR",
     "ses-TerraX260702T1518": "CR",
     # pilot 7T Terra.X, PatientName `Moore` -- a subject new to the project
     "ses-TerraX260812T1608": "SM",
