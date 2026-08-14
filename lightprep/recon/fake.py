@@ -222,7 +222,7 @@ def native(t1, subject: str, subjects_dir, *, conform: str = "min",
     """``recon-all`` on a volume whose conform is a bit-exact no-op.
 
     Args:
-        t1: The T1-weighted volume.
+        t1: The T1-weighted volume. Exactly one -- see Raises.
         subject: FreeSurfer subject name.
         subjects_dir: SUBJECTS_DIR to write into.
         conform: Which conform grid to imitate. ``min`` keeps the native
@@ -253,6 +253,8 @@ def native(t1, subject: str, subjects_dir, *, conform: str = "min",
         :func:`lightprep.recon.correct` to get usable derivatives.
 
     Raises:
+        ValueError: If more than one structural is given. Merging them is an
+            interpolation, which this method exists to avoid.
         RuntimeError: If ``verify`` is set and conform is not bit-exact -- in
             which case the anatomy was interpolated after all and the whole
             point is lost.
@@ -264,6 +266,18 @@ def native(t1, subject: str, subjects_dir, *, conform: str = "min",
             distortion is there either way.
     """
     from .auto import MAX_ANISOTROPY, AnisotropyWarning, anisotropy, within
+
+    if not isinstance(t1, (str, Path)) and len(list(t1)) > 1:
+        raise ValueError(
+            "the 'native' method takes one structural. Averaging several is "
+            "what FreeSurfer's -motioncor stage does, and it cannot be done "
+            "here: the average is an interpolation of at least one input, "
+            "which is the very thing this method exists to avoid, and it "
+            "would be computed in the fake anisotropic metric, where a rigid "
+            "head movement between scans is not rigid. Use recon.hires (or "
+            "recon.auto, which picks it) to merge them.")
+    if not isinstance(t1, (str, Path)):
+        t1 = list(t1)[0]
 
     limit = MAX_ANISOTROPY if max_anisotropy is None else max_anisotropy
     ratio = anisotropy(t1)
@@ -312,4 +326,4 @@ def native(t1, subject: str, subjects_dir, *, conform: str = "min",
 
     return ReconResult(subject=subject, subjects_dir=subjects_dir,
                        method="native", interpolated=False, conform="none",
-                       geometry=geom, input_volume=faked)
+                       geometry=geom, inputs=(faked,))

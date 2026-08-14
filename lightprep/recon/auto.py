@@ -24,6 +24,7 @@ theorem, which is why it is a parameter.
 from __future__ import annotations
 
 import warnings
+from pathlib import Path
 
 import nibabel as nib
 import numpy as np
@@ -102,7 +103,8 @@ def auto(t1, subject: str, subjects_dir, *, method: str | None = None,
     FreeSurfer's view of the head more than one resampling would.
 
     Args:
-        t1: The T1-weighted volume.
+        t1: The T1-weighted volume, or several. Several means they must be
+            averaged, which ``native`` cannot do, so ``fallback`` is chosen.
         subject: FreeSurfer subject name.
         subjects_dir: SUBJECTS_DIR to write into.
         method: Override the choice entirely -- ``"native"``, ``"hires"`` or
@@ -134,9 +136,23 @@ def auto(t1, subject: str, subjects_dir, *, method: str | None = None,
             raise ValueError(f"unknown {what} {name!r}; "
                              f"available: {sorted(set(METHODS) - {'auto'})}")
 
-    chosen, ratio = choose_method(t1, max_anisotropy=max_anisotropy,
+    multiple = not isinstance(t1, (str, Path)) and len(list(t1)) > 1
+    probe = list(t1)[0] if not isinstance(t1, (str, Path)) else t1
+    chosen, ratio = choose_method(probe, max_anisotropy=max_anisotropy,
                                   fallback=fallback)
-    if method is not None and method != chosen:
+    if multiple and chosen == "native":
+        # Several structurals can be averaged into one anatomy, which is worth
+        # more than avoiding the interpolation: recon-all's -motioncor stage
+        # aligns them with mri_robust_template and takes a median, buying real
+        # SNR. native cannot do it -- averaging interpolates by construction.
+        chosen = fallback
+        warnings.warn(
+            f"{len(list(t1))} structurals given, so they will be averaged into "
+            f"one anatomy by FreeSurfer's -motioncor stage. That is an "
+            f"interpolation, which 'native' exists to avoid, so {fallback!r} "
+            f"is used instead. Pass a single volume to keep 'native'.",
+            AnisotropyWarning, stacklevel=2)
+    elif method is not None and method != chosen:
         chosen = method
     elif chosen != "native":
         warnings.warn(

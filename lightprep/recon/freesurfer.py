@@ -63,6 +63,22 @@ def field_strength_args(field_strength) -> list:
         f"unsupported field_strength {field_strength!r}; expected 1.5, 3 or 7")
 
 
+def _as_inputs(t1) -> list:
+    """Normalise a single path or a sequence of them to a list of Paths.
+
+    More than one structural is not a special case for FreeSurfer: its
+    ``-motioncor`` stage aligns every ``-i`` volume with ``mri_robust_template``
+    and averages them into one ``orig.mgz``, which is the usual way to spend a
+    repeated MPRAGE on SNR rather than on a second recon.
+    """
+    if isinstance(t1, (str, Path)):
+        return [Path(t1)]
+    paths = [Path(p) for p in t1]
+    if not paths:
+        raise ValueError("no input volume given")
+    return paths
+
+
 def _recon_all(
     t1,
     subject: str,
@@ -99,9 +115,12 @@ def _recon_all(
         # which mris_inflate honours and which that buggy line never inspects.
         (subjects_dir / "global-expert-options.txt").write_text(expert + "\n")
 
+    inputs = _as_inputs(t1)
     cmd = ["recon-all", "-all", *field_strength_args(field_strength),
-           *(extra or []), "-s", subject, "-i", str(t1),
-           "-sd", str(subjects_dir), "-threads", str(threads)]
+           *(extra or []), "-s", subject]
+    for volume in inputs:            # one -i each; recon-all averages them
+        cmd += ["-i", str(volume)]
+    cmd += ["-sd", str(subjects_dir), "-threads", str(threads)]
     if parallel:
         cmd.append("-parallel")
     run(cmd, extra_env=_freesurfer_env(freesurfer_home, subjects_dir))
@@ -112,7 +131,8 @@ def std(t1, subject: str, subjects_dir, **kwargs) -> ReconResult:
     """``recon-all -all``, conformed to 1 mm isotropic.
 
     Args:
-        t1: The T1-weighted volume.
+        t1: The T1-weighted volume, or several: FreeSurfer aligns and averages
+            multiple inputs into one anatomy.
         subject: FreeSurfer subject name.
         subjects_dir: SUBJECTS_DIR to write into.
         **kwargs: Passed to the shared runner -- ``field_strength`` (default
@@ -127,7 +147,7 @@ def std(t1, subject: str, subjects_dir, **kwargs) -> ReconResult:
     subject_dir = _recon_all(t1, subject, subjects_dir, **kwargs)
     return ReconResult(subject=subject, subjects_dir=subject_dir.parent,
                        method="std", interpolated=True, conform="1mm",
-                       input_volume=Path(t1))
+                       inputs=tuple(_as_inputs(t1)))
 
 
 def hires(t1, subject: str, subjects_dir, *, expert: str | None = HIRES_EXPERT,
@@ -139,7 +159,9 @@ def hires(t1, subject: str, subjects_dir, *, expert: str | None = HIRES_EXPERT,
     anisotropic or oblique data is still interpolated once.
 
     Args:
-        t1: The T1-weighted volume.
+        t1: The T1-weighted volume, or several: FreeSurfer aligns and averages
+            multiple inputs into one anatomy, which is the reason to prefer
+            this method over ``native`` for a subject scanned twice.
         subject: FreeSurfer subject name.
         subjects_dir: SUBJECTS_DIR to write into.
         expert: Expert options file contents. Defaults to
@@ -153,4 +175,4 @@ def hires(t1, subject: str, subjects_dir, *, expert: str | None = HIRES_EXPERT,
                              expert=expert, **kwargs)
     return ReconResult(subject=subject, subjects_dir=subject_dir.parent,
                        method="hires", interpolated=True, conform="min",
-                       input_volume=Path(t1))
+                       inputs=tuple(_as_inputs(t1)))

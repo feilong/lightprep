@@ -129,7 +129,9 @@ class ReconResult:
             conform was made a no-op.
         geometry: For ``native``, the :class:`FakeGeometry` needed to undo the
             fake affine. ``None`` for the methods that do not fake one.
-        input_volume: The volume actually handed to ``recon-all``.
+        inputs: The volume(s) actually handed to ``recon-all``. More than one
+            means FreeSurfer's ``-motioncor`` stage aligned and averaged them
+            into a single ``orig.mgz``.
     """
 
     subject: str
@@ -138,7 +140,12 @@ class ReconResult:
     interpolated: bool
     conform: str
     geometry: FakeGeometry | None = None
-    input_volume: Path | None = None
+    inputs: tuple[Path, ...] = ()
+
+    @property
+    def merged(self) -> bool:
+        """Whether several structurals were averaged into one anatomy."""
+        return len(self.inputs) > 1
 
     @property
     def subject_dir(self) -> Path:
