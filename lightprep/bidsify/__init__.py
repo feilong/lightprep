@@ -9,8 +9,10 @@ Driven by ``scripts/dicom2bids.py``.
 
 from .correct import (
     correct_func_naming,
+    disambiguate_anat,
     normalize_func_acq,
     recover_phase_sbref,
+    regenerate_scans_tsv,
     rename_task,
     scanner_from_station,
     session_label,
@@ -18,6 +20,7 @@ from .correct import (
 )
 
 __all__ = [
-    "correct_func_naming", "normalize_func_acq", "recover_phase_sbref",
-    "rename_task", "scanner_from_station", "session_label", "subject_label",
+    "correct_func_naming", "disambiguate_anat", "normalize_func_acq",
+    "recover_phase_sbref", "regenerate_scans_tsv", "rename_task",
+    "scanner_from_station", "session_label", "subject_label",
 ]
