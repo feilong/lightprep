@@ -13,6 +13,7 @@ aid, not a biometric.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import nibabel as nib
@@ -217,3 +218,167 @@ def format_report(result) -> str:
         lines.append(f"  {label:<28} 1NN -> {nn:<28} r={r:.3f}")
     return "\n".join(lines)
 
+
+# --------------------------------------------------------------- QC workflow --
+@dataclass(frozen=True)
+class IdentityQC:
+    """Verdict of checking session labels against brain shape.
+
+    Attributes:
+        labels: One name per scan, in matrix order.
+        subjects: The subject each scan claims to belong to.
+        matrix: Directional similarity, row i registered onto column j.
+        within: Similarity over ordered pairs claiming the same subject.
+        between: Similarity over ordered pairs claiming different subjects.
+        separation: ``min(within) - max(between)``. Positive means the two
+            distributions do not overlap, which is what makes the labelling
+            checkable rather than merely plausible.
+        nearest: ``[(label, nn_label, r, ok)]`` -- each scan's most similar
+            other scan, and whether it belongs to the same subject.
+        mismatches: Scans whose nearest neighbour is a different subject.
+        singletons: Scans that are the only one for their subject, so they
+            have no within-subject pair and cannot be checked this way.
+    """
+
+    labels: tuple[str, ...]
+    subjects: tuple[str, ...]
+    matrix: np.ndarray
+    within: np.ndarray
+    between: np.ndarray
+    separation: float
+    nearest: tuple
+    mismatches: tuple[str, ...]
+    singletons: tuple[str, ...]
+
+    @property
+    def passed(self) -> bool:
+        """No scan looks more like somebody else than like its own subject."""
+        return not self.mismatches
+
+    @property
+    def asymmetry(self) -> np.ndarray:
+        """``|M[i,j] - M[j,i]|`` over unordered pairs.
+
+        A running check on the method rather than the data: it should be small,
+        but if it is comparable to ``separation`` then direction matters more
+        than identity does and the threshold is not meaningful.
+        """
+        n = len(self.labels)
+        return np.array([abs(self.matrix[i, j] - self.matrix[j, i])
+                         for i in range(n) for j in range(i + 1, n)])
+
+
+def collect_bids_anat(bids_dir, suffix: str = "T1w"):
+    """Every anatomical of a given suffix in a BIDS tree.
+
+    Args:
+        bids_dir: BIDS dataset root.
+        suffix: BIDS suffix to collect, e.g. ``T1w``, ``T2w``, ``UNIT1``.
+
+    Returns:
+        ``(paths, labels, subjects)``. Labels are ``sub/ses`` where sessions
+        exist and ``sub`` where they do not.
+    """
+    bids_dir = Path(bids_dir)
+    paths, labels, subjects = [], [], []
+    for sub_dir in sorted(p for p in bids_dir.glob("sub-*") if p.is_dir()):
+        sub = sub_dir.name.replace("sub-", "")
+        for img in sorted(sub_dir.glob(f"**/anat/*_{suffix}.nii*")):
+            ses = next((p[4:] for p in img.name.split("_")
+                        if p.startswith("ses-")), None)
+            paths.append(img)
+            labels.append(f"{sub}/{ses}" if ses else sub)
+            subjects.append(sub)
+    return paths, labels, subjects
+
+
+def identity_qc(t1_paths, subjects, labels=None, **kwargs) -> IdentityQC:
+    """Check that scans claiming the same subject really are the same brain.
+
+    Wraps :func:`pairwise_similarity` with the comparison that makes it a QC
+    rather than a matrix: within-subject similarity against between-subject,
+    and a 1-nearest-neighbour verdict per scan.
+
+    Mislabelling is the failure this exists to catch, and nothing downstream
+    catches it. A swapped session produces surfaces that fit one brain and
+    timeseries sampled from another, and every later stage runs happily.
+
+    Args:
+        t1_paths: One structural per scan.
+        subjects: The subject each scan claims to belong to, same length.
+        labels: Display names; defaults to ``subjects``.
+        **kwargs: Passed to :func:`pairwise_similarity` (``work_dir``,
+            ``downsample_mm``, ``strip``).
+
+    Returns:
+        An :class:`IdentityQC`.
+
+    Raises:
+        ValueError: If fewer than two scans are given, or the lengths disagree.
+    """
+    t1_paths = [Path(p) for p in t1_paths]
+    subjects = list(subjects)
+    if len(t1_paths) < 2:
+        raise ValueError(f"need at least two scans to compare, got {len(t1_paths)}")
+    if len(subjects) != len(t1_paths):
+        raise ValueError(
+            f"{len(subjects)} subject labels for {len(t1_paths)} scans")
+    labels = list(labels) if labels is not None else list(subjects)
+
+    M = pairwise_similarity(t1_paths, labels=labels, **kwargs)["matrix"]
+    n = len(labels)
+
+    # Ordered pairs: a directional matrix has two measurements per pair, and
+    # both are evidence.
+    within = np.array([M[i, j] for i in range(n) for j in range(n)
+                       if i != j and subjects[i] == subjects[j]])
+    between = np.array([M[i, j] for i in range(n) for j in range(n)
+                        if i != j and subjects[i] != subjects[j]])
+    separation = (float(within.min() - between.max())
+                  if within.size and between.size else float("nan"))
+
+    nearest, mismatches, singletons = [], [], []
+    for i in range(n):
+        j = int(next(k for k in np.argsort(M[i])[::-1] if k != i))
+        ok = subjects[j] == subjects[i]
+        alone = not any(k != i and subjects[k] == subjects[i] for k in range(n))
+        nearest.append((labels[i], labels[j], float(M[i, j]), ok))
+        if alone:
+            singletons.append(labels[i])
+        elif not ok:
+            mismatches.append(labels[i])
+
+    return IdentityQC(
+        labels=tuple(labels), subjects=tuple(subjects), matrix=M,
+        within=within, between=between, separation=separation,
+        nearest=tuple(nearest), mismatches=tuple(mismatches),
+        singletons=tuple(singletons))
+
+
+def format_qc(qc: IdentityQC) -> str:
+    """The matrix, the within/between contrast, and the per-scan verdict."""
+    lines = [format_matrix({"labels": list(qc.labels), "matrix": qc.matrix}), ""]
+    for name, vals in (("within-subject", qc.within), ("between-subject", qc.between)):
+        if vals.size:
+            lines.append(f"{name:<16s} n={vals.size:>3d}  mean {vals.mean():.3f}  "
+                         f"min {vals.min():.3f}  max {vals.max():.3f}")
+    if np.isfinite(qc.separation):
+        verdict = "cleanly separated" if qc.separation > 0 else "OVERLAP -- inspect"
+        lines.append(f"{'separation':<16s} lowest within - highest between = "
+                     f"{qc.separation:+.3f}  ({verdict})")
+    asym = qc.asymmetry
+    if asym.size:
+        lines.append(f"{'asymmetry':<16s} |M[i,j]-M[j,i]| median "
+                     f"{np.median(asym):.4f}, max {asym.max():.4f}")
+
+    lines += ["", "nearest neighbour of each scan:"]
+    for label, nn, r, ok in qc.nearest:
+        note = ("(only scan for this subject)" if label in qc.singletons
+                else "same subject" if ok else "DIFFERENT SUBJECT")
+        lines.append(f"  {label:<16s} -> {nn:<16s} r={r:.3f}   {note}")
+    lines.append("")
+    lines.append("PASS: every scan's nearest neighbour is the same subject."
+                 if qc.passed else
+                 f"FAIL: {len(qc.mismatches)} scan(s) look more like another "
+                 f"subject: {', '.join(qc.mismatches)}")
+    return "\n".join(lines)
