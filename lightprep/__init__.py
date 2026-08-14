@@ -23,6 +23,13 @@ MEDIC field maps in about 12s. The original methods are unchanged and still
 selectable by name; each step's docstring sets out what its niimath method
 trades away.
 
+:mod:`lightprep.recon` is the odd one out: it is anatomical rather than
+functional, and it wraps FreeSurfer rather than replacing it. It exists because
+``recon-all`` conforms every input to an isotropic axis-aligned grid, which
+interpolates anything anisotropic or obliquely prescribed before the pipeline
+has even started. Its ``native`` method makes that conform a bit-exact no-op,
+and :func:`lightprep.recon.correct` undoes the deception analytically.
+
 Two things niimath does not do are left alone rather than approximated.
 :mod:`lightprep.resample` needs warp *composition* to spend a single
 interpolation, which niimath has no equivalent of -- though its ``-unwarp`` does
@@ -43,9 +50,9 @@ across 8 threads against roughly 9s on one -- though :mod:`lightprep.hmc.moco`,
 the default, is fast either way. Set ``OMP_NUM_THREADS`` to control it.
 """
 
-from . import coreg, combine, decay, glm, hmc, resample, sdc, surface
+from . import coreg, combine, decay, glm, hmc, recon, resample, sdc, surface
 from ._niimath import NIIMATH
 
 __version__ = "0.1.0"
-__all__ = ["coreg", "combine", "decay", "glm", "hmc", "resample", "sdc",
-           "surface", "NIIMATH"]
+__all__ = ["coreg", "combine", "decay", "glm", "hmc", "recon", "resample",
+           "sdc", "surface", "NIIMATH"]
