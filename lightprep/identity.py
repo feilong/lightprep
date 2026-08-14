@@ -70,6 +70,14 @@ def _downsample(img: Path, out: Path, mm: float) -> Path:
 
 
 def _corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Pearson r, accumulated in float64.
+
+    Images are read as float32 -- that is what the scanner wrote -- but the
+    sums here run over millions of voxels, and float32 accumulation over that
+    many terms is not accurate enough to be compared at three decimal places.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
     a = (a - a.mean()) / (a.std() + 1e-9)
     b = (b - b.mean()) / (b.std() + 1e-9)
     return float((a * b).mean())
@@ -122,13 +130,13 @@ def pairwise_similarity(t1_paths, labels=None, work_dir=None, downsample_mm=2.0,
     n = len(prepped)
     M = np.eye(n)
     for j in range(n):                                   # reference (fixed) = j
-        ref = nib.load(prepped[j]).get_fdata(dtype=np.float32)
+        ref = nib.load(prepped[j]).get_fdata(dtype=np.float64)
         mask = ref > np.percentile(ref, 70)
         for i in range(n):
             if i == j:
                 continue
             moved = _flirt(prepped[i], prepped[j], work / f"{i:02d}_to_{j:02d}.nii.gz")
-            mov = nib.load(moved).get_fdata(dtype=np.float32)
+            mov = nib.load(moved).get_fdata(dtype=np.float64)
             M[i, j] = _corr(mov[mask], ref[mask])
     return {"labels": labels, "matrix": M}
 
@@ -173,10 +181,15 @@ def brain_similarity(t1_paths, labels=None, work_dir=None, reference_idx=0):
         aligned.append(b if i == reference_idx
                        else _flirt(b, ref, work / f"{i:02d}_aligned.nii.gz"))
 
-    vols = [nib.load(a).get_fdata(dtype=np.float32) for a in aligned]
+    vols = [nib.load(a).get_fdata(dtype=np.float64) for a in aligned]
     stack = np.stack(vols, 0)                                # (N, X, Y, Z)
     mask = stack.mean(0) > np.percentile(stack.mean(0), 70)  # shared brain
-    # z-score each brain within the mask, then correlate
+    # z-score each brain within the mask, then correlate. float64 throughout:
+    # X @ X.T sums over every masked voxel -- 5.2M of them on a 1mm T1 -- and
+    # BLAS sgemm has no pairwise summation to fall back on, so in float32 the
+    # error reaches 1% here. It shows up as a diagonal that is not 1 (measured:
+    # 1.0106) and, less visibly, as the same size of error on the off-diagonal
+    # similarities this function exists to report.
     X = stack[:, mask]
     X = (X - X.mean(1, keepdims=True)) / (X.std(1, keepdims=True) + 1e-9)
     sim = (X @ X.T) / X.shape[1]
@@ -203,3 +216,4 @@ def format_report(result) -> str:
     for label, nn, r in result["nearest"]:
         lines.append(f"  {label:<28} 1NN -> {nn:<28} r={r:.3f}")
     return "\n".join(lines)
+

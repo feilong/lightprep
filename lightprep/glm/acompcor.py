@@ -151,7 +151,11 @@ def compcor_components(volume_timeseries, roi, n_components=6, trend_order=2):
         ``(T, n_components)`` array, and the fraction of ROI variance each
         component explains.
     """
-    ts = volume_timeseries[roi].T                       # (T, nVox)
+    # float64 explicitly. This was previously float64 only by accident -- the
+    # Legendre design matrix is float64, so lstsq promoted and everything
+    # downstream inherited it. A change there would have silently dropped the
+    # SVD to float32 with nothing to notice it.
+    ts = np.asarray(volume_timeseries, dtype=np.float64)[roi].T   # (T, nVox)
     ts = ts[:, np.all(np.isfinite(ts), axis=0) & (ts.std(0) > 0)]
     ts = _detrend_and_normalise(ts, trend_order)
     # temporal PCs: left singular vectors of (time x voxel)
@@ -170,7 +174,7 @@ def optimal_combination_volume(echo_paths, echo_times_ms):
     from ..combine.optimal import optimal_weights
 
     imgs = [nib.load(str(p)) for p in echo_paths]
-    data = np.stack([im.get_fdata(dtype=np.float32) for im in imgs], axis=-1)  # (X,Y,Z,T,E)
+    data = np.stack([im.get_fdata(dtype=np.float64) for im in imgs], axis=-1)  # (X,Y,Z,T,E)
     shape = data.shape[:3]
     flat = data.reshape(-1, data.shape[3], data.shape[4])                     # (V,T,E)
     mean_sig = flat.mean(axis=1)                                              # (V,E)

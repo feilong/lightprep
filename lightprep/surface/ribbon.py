@@ -93,7 +93,12 @@ def ribbon_average(
         )
 
     img = nib.load(volume)
-    data = img.get_fdata(dtype=np.float32)
+    # float64: map_coordinates works in the input's dtype, and the spline
+    # prefilter is a recursive filter whose error accumulates. The measured
+    # difference against float32 is small (3e-7 relative) but this is the one
+    # interpolation the whole pipeline is built around, so it is not the place
+    # to spend precision.
+    data = img.get_fdata(dtype=np.float64)
     if data.ndim == 3:
         data = data[..., None]
     n_frames = data.shape[3]
@@ -121,7 +126,7 @@ def ribbon_average(
     ).reshape(len(depths), n_vert)
     n_outside = int((~inside.all(axis=0)).sum())
 
-    out_ts = np.empty((n_vert, n_frames), dtype=np.float32)
+    out_ts = np.empty((n_vert, n_frames), dtype=np.float64)
     for t in range(n_frames):
         vals = map_coordinates(
             data[..., t], coords, order=order, mode="constant", cval=np.nan

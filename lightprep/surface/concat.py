@@ -106,7 +106,9 @@ def ribbon_average_concat(
         raise ValueError(f"white {wv.shape} and pial {pv.shape} must correspond")
 
     img = nib.load(str(volume))
-    data = img.get_fdata(dtype=np.float32)
+    # float64 for the sampling itself -- see the note in ribbon.py. GIfTI
+    # output stays float32, which is the format's convention.
+    data = img.get_fdata(dtype=np.float64)
     if data.ndim == 3:
         data = data[..., None]
     n_frames = data.shape[3]
@@ -115,7 +117,7 @@ def ribbon_average_concat(
         raise ValueError(f"{len(transforms)} rigid transforms for {n_frames} frames")
 
     dmap_img = nib.load(str(sdc_result.displacement_map))
-    dmap = dmap_img.get_fdata(dtype=np.float32)
+    dmap = dmap_img.get_fdata(dtype=np.float64)
     static = dmap.ndim == 3
     if not static and dmap.shape[3] not in (1, n_frames):
         raise ValueError(
@@ -142,7 +144,7 @@ def ribbon_average_concat(
 
     ref_vox = to_vox(pts_ref)
     order = INTERP_ORDERS[interp]
-    out_ts = np.empty((n_vert, n_frames), dtype=np.float32)
+    out_ts = np.empty((n_vert, n_frames), dtype=np.float64)
     ever_outside = np.zeros(len(pts_anat), dtype=bool)
     hi = np.array(data.shape[:3]) - 1
 

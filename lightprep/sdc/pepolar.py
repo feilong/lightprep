@@ -62,7 +62,7 @@ def _acq_row(pe_direction: str, readout_time: float) -> str:
 def _load_4d(path: Path):
     """Load an image as 4D, promoting a 3D volume to a single-frame series."""
     img = nib.load(path)
-    data = img.get_fdata(dtype=np.float32)
+    data = img.get_fdata(dtype=np.float64)
     if data.ndim == 3:
         data = data[..., np.newaxis]
     elif data.ndim != 4:
@@ -252,10 +252,14 @@ def pepolar(
     ref_img = nib.load(target)
     voxel_pe = float(ref_img.header.get_zooms()[_pe_axis_index(axis)])
     field = nib.load(fmap_on_target)
-    hz = field.get_fdata(dtype=np.float32)
+    # float64 for the Hz -> mm conversion; the images are written float32,
+    # which is the NIfTI convention, but the arithmetic is not done in it.
+    hz = field.get_fdata(dtype=np.float64)
 
     fieldmap = out_dir / "fieldmap_hz.nii.gz"
-    nib.Nifti1Image(hz, field.affine, field.header).to_filename(fieldmap)
+    nib.Nifti1Image(
+        hz.astype(np.float32), field.affine, field.header
+    ).to_filename(fieldmap)
 
     displacement = sign * hz * total_readout_time * voxel_pe
     dmap = out_dir / "displacementmap.nii.gz"

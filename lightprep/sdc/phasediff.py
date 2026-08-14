@@ -42,7 +42,7 @@ def _rescale_phase(src: Path, dst: Path) -> tuple[float, float]:
     observed range sidesteps the guesswork.
     """
     img = nib.load(src)
-    data = img.get_fdata(dtype=np.float32)
+    data = img.get_fdata(dtype=np.float64)
     lo, hi = float(data.min()), float(data.max())
     if hi <= lo:
         raise ValueError(f"phase image {src.name} has no range: min==max=={lo}")
@@ -154,12 +154,15 @@ def phasediff(
     ref_img = nib.load(target)
     voxel_pe = float(ref_img.header.get_zooms()[_pe_axis_index(axis)])
     rads = nib.load(fmap_on_target)
-    hz = rads.get_fdata(dtype=np.float32) / (2 * np.pi)
+    # float64 for the rad/s -> Hz -> mm conversion; written out as float32.
+    hz = rads.get_fdata(dtype=np.float64) / (2 * np.pi)
     mask = nib.load(mask_on_target).get_fdata() > 0.5
     hz *= mask
 
     fieldmap = out_dir / "fieldmap_hz.nii.gz"
-    nib.Nifti1Image(hz, rads.affine, rads.header).to_filename(fieldmap)
+    nib.Nifti1Image(
+        hz.astype(np.float32), rads.affine, rads.header
+    ).to_filename(fieldmap)
 
     displacement = sign * hz * total_readout_time * voxel_pe
     dmap = out_dir / "displacementmap.nii.gz"
