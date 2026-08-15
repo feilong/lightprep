@@ -50,9 +50,10 @@ across 8 threads against roughly 9s on one -- though :mod:`lightprep.hmc.moco`,
 the default, is fast either way. Set ``OMP_NUM_THREADS`` to control it.
 """
 
-from . import coreg, combine, decay, glm, hmc, recon, resample, sdc, surface
+from . import (combine, coreg, decay, glm, hmc, qc, recon, resample, sdc,
+               surface)
 from ._niimath import NIIMATH
 
 __version__ = "0.1.0"
-__all__ = ["coreg", "combine", "decay", "glm", "hmc", "recon", "resample",
-           "sdc", "surface", "NIIMATH"]
+__all__ = ["coreg", "combine", "decay", "glm", "hmc", "qc", "recon",
+           "resample", "sdc", "surface", "NIIMATH"]
