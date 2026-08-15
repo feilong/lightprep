@@ -57,7 +57,9 @@ VOLUMES = (
     "brain.finalsurfs.mgz",
     "wm.mgz",
     "aseg.mgz",             # subcortical labels
-    "aparc+aseg.mgz",       # + cortical parcellation
+    "aparc+aseg.mgz",       # + cortical parcellation (Desikan-Killiany)
+    "aparc.a2009s+aseg.mgz",  # + cortical parcellation (Destrieux)
+    "wmparc.mgz",           # white matter parcellated by overlying gyrus
     "ribbon.mgz",
 )
 
