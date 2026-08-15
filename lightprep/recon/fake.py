@@ -313,8 +313,16 @@ def native(t1, subject: str, subjects_dir, *, conform: str = "min",
     meta = geom.to_json(work / f"{subject}_native2true.json")
 
     # A submillimetre grid is only accepted with -hires, whatever put it there.
+    #
+    # No -cubic. It selects the interpolation mri_convert uses for the conform
+    # step, and this method exists to make that step a no-op -- the check above
+    # refuses to go on unless it provably is, so no voxel is ever interpolated
+    # and the kernel is never exercised. Worse, that check runs mri_convert
+    # without -rt, i.e. trilinear, so passing -cubic to recon-all verified one
+    # kernel and ran another. They agree only because both are the identity on
+    # an exact grid; asking for neither makes the guarantee describe the run.
     voxel = float(np.min(np.linalg.norm(geom.a_fake[:3, :3], axis=0)))
-    extra = ["-hires", "-cubic"] if voxel < SUBMM_MM else ["-cubic"]
+    extra = ["-hires"] if voxel < SUBMM_MM else []
 
     subject_dir = _recon_all(
         faked, subject, subjects_dir, extra=extra, expert=expert,
