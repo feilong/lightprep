@@ -115,6 +115,7 @@ def medic(
         still-distorted space to model the field for that frame.
     """
     try:
+        import warpkit as _warpkit
         from warpkit.api import medic as _warpkit_medic
     except ImportError as exc:  # pragma: no cover - depends on environment
         from .._utils import DependencyError
@@ -128,15 +129,32 @@ def medic(
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    result = _warpkit_medic(
+    kwargs = dict(
         phase=pha,
         magnitude=mag,
         out_prefix=str(out_dir / prefix),
         metadata=meta,
         noise_frames=noise_frames,
         n_cpus=n_cpus,
-        wrap_limit=wrap_limit,
     )
+    # warpkit dropped `wrap_limit` (absent in 1.5.0). Its old default was False,
+    # i.e. heuristics on, which is what omitting it now gives -- so the default
+    # path is unchanged. Only an explicit request cannot be honoured, and that
+    # is worth failing on rather than silently ignoring.
+    import inspect
+
+    if "wrap_limit" in inspect.signature(_warpkit_medic).parameters:
+        kwargs["wrap_limit"] = wrap_limit
+    elif wrap_limit:
+        from .._utils import DependencyError
+
+        raise DependencyError(
+            "wrap_limit=True was requested, but the installed warpkit "
+            f"({getattr(_warpkit, '__version__', 'unknown')}) has no such "
+            "argument; it was removed after 1.4. Either drop the argument or "
+            "pin an older warpkit."
+        )
+    result = _warpkit_medic(**kwargs)
 
     return SDCResult(
         fieldmap_native=Path(result.fieldmap_native),
