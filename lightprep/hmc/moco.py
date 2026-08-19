@@ -760,6 +760,33 @@ def step_motion(pulls, centroid, moment, count) -> np.ndarray:
     return steps
 
 
+
+def neighbour_motion(steps) -> np.ndarray:
+    """Per-frame local motion: the mean of the step into a frame and out of it.
+
+    ``steps`` is frame-to-frame motion, so entry ``t`` is the step from ``t-1``
+    into ``t``. A frame is compromised by movement on either side of it -- one
+    that arrives still and is left immediately afterwards is smeared just as
+    surely as the reverse -- so scoring a frame by the step *into* it alone
+    misses half the cases.
+
+    The mean rather than the sum only because it keeps the score in the same
+    millimetres as the steps; for a rank-based selection the two are identical.
+    The first and last frames have one neighbour each and take that step
+    unhalved, which is the same quantity, not a special case.
+    """
+    steps = np.asarray(steps, dtype=np.float64).ravel()
+    n = steps.size
+    if n < 2:
+        return np.zeros(n)
+    local = np.empty(n)
+    local[0] = steps[1]
+    local[-1] = steps[-1]
+    if n > 2:
+        local[1:-1] = (steps[1:-1] + steps[2:]) / 2.0
+    return local
+
+
 def _cdtm_values(corrected, mask):
     """Per-frame correlation distance to the run's iteratively refined mean.
 
@@ -922,13 +949,14 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         # And it only applies to an interleaved acquisition. A sequential one
         # has no odd/even split to exploit, so the within-TR term has to be
         # dropped rather than computed wrongly; read SliceTiming and decide.
-        if seed is None:
-            relative = relative_displacement(
-                relative_motion(echo, work / "relative.1D"))
-            save_trace(relative, out_dir / "relative_fd.txt")
-            index = quiet_reference(relative, history=history)
-        else:
-            index = int(seed)
+        # Frame-to-frame motion is a property of the data, not of whatever is
+        # being registered to, so one pass serves the seed and every round's
+        # between-TR score. Fitting each pair directly also beats differencing
+        # two fits against a common target, which inherits the error of both.
+        steps = relative_motion(echo, work / "relative.1D")
+        relative = relative_displacement(steps)
+        save_trace(relative, out_dir / "relative_fd.txt")
+        index = quiet_reference(relative, history=history) if seed is None else int(seed)
         if not 0 <= index < n_volumes:
             raise ValueError(
                 f"seed volume {index} is out of range for {n_volumes} volumes"
@@ -969,15 +997,30 @@ def groupwise_reference(echo, out_dir, *, seed=None,
                     mask = vol > np.percentile(vol[vol > 0], 40.0)
                 dilated = ndimage.binary_dilation(mask, iterations=dilate)
 
-            geom = brain_geometry(boldref if round_index else grid, mask=mask)
-            scores = {
-                "within_tr": within_tr_motion(echo, index, *geom,
-                                              work / f"wtr{round_index}"),
-                "between_tr": step_motion(pulls, *geom),
-                # Dilated here: the brain/air boundary is where motion shows.
-                "cdtm": np.asarray(_cdtm_values(corrected, dilated),
-                                   dtype=np.float64),
-            }
+                # Undilated for anything geometric: there the mask sets a second
+                # moment, and padding it only lengthens the rotational lever arm.
+                # Every reference image sits on the input's grid, so this does
+                # not change from round to round either.
+                geom = brain_geometry(grid, mask=mask)
+
+                # Neither motion score depends on what is being registered to.
+                # within-TR fits each slice stack to a fixed TR of the input;
+                # between-TR fits neighbouring input frames to each other. Both
+                # are properties of the data, so they are measured once and
+                # reused -- recomputing them per round would repeat two -moco
+                # passes to arrive at the same numbers.
+                motion = {
+                    "within_tr": within_tr_motion(echo, index, *geom,
+                                                  work / "within_tr"),
+                    "between_tr": neighbour_motion(
+                        relative_rms(steps, grid, mask=mask)),
+                }
+
+            # Only CDTM moves between rounds: it scores frames against the
+            # corrected series, which is the one thing the reference changes.
+            scores = dict(motion,
+                          cdtm=np.asarray(_cdtm_values(corrected, dilated),
+                                          dtype=np.float64))
             keep, fraction, flags, agreement = select_frames(
                 scores, max_drop=max_drop)
             values = scores
