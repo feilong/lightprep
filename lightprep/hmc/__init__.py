@@ -54,7 +54,7 @@ from .base import (HMCResult, TransformReplayError, UNREPLAYABLE_METHODS,
 from .fsl import mcflirt
 from .moco import (REF_STABLE, REF_TEMPLATE, best_reference, brain_geometry,
                    centre_pulls, frechet_mean_pose, moco, pose_distance,
-                   quiet_reference, relative_displacement, relative_motion,
+                   quiet_reference, relative_displacement, relative_motion, relative_rms,
                    stable_reference, supports_bin, supports_ref,
                    supports_relative, select_frames, step_motion,
                    template_reference, within_tr_motion)
@@ -89,7 +89,8 @@ def get_method(name: str | None = None):
 __all__ = ["HMCResult", "moco", "allineate", "mcflirt", "METHODS",
            "DEFAULT_METHOD", "get_method", "TransformReplayError",
            "UNREPLAYABLE_METHODS", "check_transforms_replayable",
-           "relative_motion", "relative_displacement", "best_reference",
+           "relative_motion", "relative_displacement", "relative_rms",
+           "best_reference",
            "stable_reference", "REF_STABLE", "supports_ref",
            "supports_relative", "supports_bin", "template_reference",
            "REF_TEMPLATE", "frechet_mean_pose", "centre_pulls",

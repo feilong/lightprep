@@ -312,6 +312,49 @@ def relative_displacement(rows, radius: float = FD_RADIUS_MM) -> np.ndarray:
             + radius * np.abs(np.radians(rows[:, :3])).sum(1))
 
 
+
+def relative_rms(rows, image, mask=None) -> np.ndarray:
+    """Per-frame RMS tissue displacement, from :func:`relative_motion` parameters.
+
+    The same steps :func:`relative_displacement` scores, measured the other way.
+    Power framewise displacement sums absolute translations and converts
+    rotation with an assumed 50mm sphere; this takes the RMS distance the
+    subject's own brain voxels actually travel, with the rotational lever arm
+    coming from their inertia tensor rather than from a constant. It is
+    therefore in the same units as :func:`within_tr_motion` and
+    :func:`step_motion`, so a within-TR and a between-TR threshold set on it
+    mean the same thing.
+
+    Neither replaces the other. Power FD is comparable across studies and needs
+    no mask; this is comparable across the *metrics here* and needs one. Report
+    both if you are publishing a number.
+
+    Args:
+        rows: ``(n_frames, 6)`` as :func:`relative_motion` returns, or a path to
+            its ``.1D``. Each row is the fit of one frame onto its predecessor,
+            so the transform it describes *is* the step.
+        image: A volume on the series' grid, for the affine and the geometry.
+        mask: Brain mask, undilated. Without one the geometry falls back to an
+            intensity threshold that tracks the field of view rather than the
+            head -- see :func:`brain_geometry`.
+
+    Returns:
+        ``(n_frames,)`` mm. Element ``t`` is how far tissue moved between volume
+        ``t - 1`` and volume ``t``; element 0 is zero by construction.
+    """
+    rows = np.asarray(rows if not isinstance(rows, (str, Path))
+                      else np.loadtxt(rows), dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[1] != 6:
+        raise ValueError(f"expected (n_frames, 6) parameters, got {rows.shape}")
+    img = nib.load(str(image))
+    centroid, moment, count = brain_geometry(image, mask=mask)
+    identity = np.eye(4)
+    return np.array([
+        pose_distance(parameters_to_pull(row, img.affine, img.shape), identity,
+                      centroid, moment, count)
+        for row in rows])
+
+
 def best_reference(displacement) -> int:
     """The volume that moved least from both of its neighbours.
 
