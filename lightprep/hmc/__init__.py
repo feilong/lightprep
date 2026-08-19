@@ -31,11 +31,11 @@ at the volume flanked by the two smallest displacements
 moves: the middle volume is chosen by counting frames, and a target the subject
 was moving through blurs every fit made against it.
 
-``ref="template"`` gives up on picking a volume at all. It seeds from the volume
+``ref="groupwise"`` gives up on picking a volume at all. It seeds from the volume
 in the quietest stretch of the raw run (:func:`quiet_reference`), then estimates,
 selects the frames that most look like the run by CDTM, averages those onto
 their own mean pose, and re-estimates against that average -- repeating until
-the selected set stops changing (:func:`template_reference`). The target
+the selected set stops changing (:func:`groupwise_reference`). The target
 therefore carries the noise of no single frame, and the loop's stopping rule is
 a fixed point rather than a round count.
 
@@ -52,12 +52,12 @@ To add a method, drop a module in this subpackage that returns an
 from .base import (HMCResult, TransformReplayError, UNREPLAYABLE_METHODS,
                    check_transforms_replayable)
 from .fsl import mcflirt
-from .moco import (REF_STABLE, REF_TEMPLATE, best_reference, brain_geometry,
+from .moco import (REF_STABLE, REF_GROUPWISE, best_reference, brain_geometry,
                    centre_pulls, frechet_mean_pose, moco, pose_distance,
                    quiet_reference, relative_displacement, relative_motion, relative_rms,
                    stable_reference, supports_bin, supports_ref,
                    supports_relative, select_frames, step_motion,
-                   template_reference, within_tr_motion)
+                   groupwise_reference, within_tr_motion)
 from .niimath import allineate
 
 #: Method name -> callable. Extend this as methods are added.
@@ -92,7 +92,7 @@ __all__ = ["HMCResult", "moco", "allineate", "mcflirt", "METHODS",
            "relative_motion", "relative_displacement", "relative_rms",
            "best_reference",
            "stable_reference", "REF_STABLE", "supports_ref",
-           "supports_relative", "supports_bin", "template_reference",
-           "REF_TEMPLATE", "frechet_mean_pose", "centre_pulls",
+           "supports_relative", "supports_bin", "groupwise_reference",
+           "REF_GROUPWISE", "frechet_mean_pose", "centre_pulls",
            "brain_geometry", "pose_distance", "quiet_reference",
            "select_frames", "within_tr_motion", "step_motion"]

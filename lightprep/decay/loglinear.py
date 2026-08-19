@@ -24,6 +24,13 @@ What survives is the residual positive bias itself: magnitude data is
 rectified, so weak late echoes read high and T2* is overestimated. It is
 negligible at good SNR (+0.01ms at SNR 100) and worth knowing about in dropout
 regions (+4.9ms at SNR 5).
+
+Neither the weighting nor the estimator addresses the larger error where the
+background field varies across a voxel: there the decay is a sinc times an
+exponential and the mono-exponential model is simply the wrong function, so
+fitting it more carefully does not help. Pass ``dephasing`` -- the sinc, from
+:mod:`lightprep.decay.macroscopic` -- to divide that factor out before the fit,
+which restores the exponential the model expects.
 """
 
 from __future__ import annotations
@@ -34,11 +41,16 @@ import nibabel as nib
 import numpy as np
 
 from .base import DecayResult
+from .macroscopic import DEFAULT_MIN_FACTOR as _DEFAULT_MIN_FACTOR
 
 #: Physically plausible bounds for T2* (ms) in brain tissue at 3T. Fits landing
 #: outside are noise, not measurement, and are marked invalid rather than kept.
 T2STAR_MIN_MS = 1.0
 T2STAR_MAX_MS = 500.0
+
+#: Default floor on the dephasing factor; re-exported from
+#: :mod:`lightprep.decay.macroscopic`, which explains the choice.
+MIN_DEPHASING_FACTOR = _DEFAULT_MIN_FACTOR
 
 
 def _read_surface_mean(path: Path) -> np.ndarray:
@@ -67,7 +79,25 @@ def _write_shape(values: np.ndarray, out: Path) -> Path:
     return out
 
 
-def fit_arrays(signal: np.ndarray, echo_times_ms, *, weighted: bool = False):
+def refused_mask(dephasing, min_factor: float = MIN_DEPHASING_FACTOR) -> np.ndarray:
+    """Vertices where the dephasing factor is too small to divide by.
+
+    True where any echo's factor is non-finite, negative (past the sinc's first
+    zero, where magnitude data has already discarded the sign) or below
+    ``min_factor``.
+    """
+    d = np.asarray(dephasing, dtype=np.float64)
+    return ~np.all(np.isfinite(d) & (d >= min_factor), axis=1)
+
+
+def fit_arrays(
+    signal: np.ndarray,
+    echo_times_ms,
+    *,
+    weighted: bool = False,
+    dephasing: np.ndarray | None = None,
+    min_factor: float = MIN_DEPHASING_FACTOR,
+):
     """Fit S0 and T2* from per-echo signal.
 
     Args:
@@ -76,6 +106,14 @@ def fit_arrays(signal: np.ndarray, echo_times_ms, *, weighted: bool = False):
         weighted: Weight each echo by its own signal. Off by default: it
             measurably increases bias rather than reducing it (see the module
             docstring).
+        dephasing: ``(nVertex, nEcho)`` intravoxel dephasing factor from
+            :mod:`lightprep.decay.macroscopic`, or None to fit the measured
+            signal as it stands. Dividing it out before the fit removes the
+            macroscopic field gradient's contribution to R2*, leaving the part
+            that belongs to the tissue.
+        min_factor: Vertices whose factor falls below this at any echo are
+            refused rather than divided: the sinc is single-valued only on its
+            main lobe, and near the zero there is no signal left to recover.
 
     Returns:
         ``(s0, t2star_ms, r2, valid)``. ``r2`` is None for two echoes, where the
@@ -90,6 +128,19 @@ def fit_arrays(signal: np.ndarray, echo_times_ms, *, weighted: bool = False):
         raise ValueError(f"echo times must be distinct, got {te}")
 
     n_vert = signal.shape[0]
+    refused = np.zeros(n_vert, dtype=bool)
+    if dephasing is not None:
+        dephasing = np.asarray(dephasing, dtype=np.float64)
+        if dephasing.shape != signal.shape:
+            raise ValueError(
+                f"dephasing {dephasing.shape} must match signal {signal.shape}"
+            )
+        # Below the floor the division is not a correction but an amplifier, and
+        # past the first zero the factor turns negative and the measurement is
+        # of a rectified side lobe. Both are refusals, not small numbers.
+        refused = refused_mask(dephasing, min_factor)
+        signal = np.where(refused[:, None], np.nan, signal / dephasing)
+
     usable = np.all(signal > 0, axis=1)          # log needs positive signal
     y = np.full((n_vert, te.size), np.nan)
     y[usable] = np.log(signal[usable])
@@ -148,6 +199,8 @@ def loglinear(
     out_prefix,
     *,
     weighted: bool = False,
+    dephasing: np.ndarray | None = None,
+    min_factor: float = MIN_DEPHASING_FACTOR,
 ) -> DecayResult:
     """Fit S0 and T2* per vertex from per-echo surface timeseries.
 
@@ -161,6 +214,10 @@ def loglinear(
             appended.
         weighted: Weight echoes by signal. Off by default; see the module
             docstring for why the obvious choice is the wrong one.
+        dephasing: ``(nVertex, nEcho)`` intravoxel dephasing factor, sampled
+            onto the same vertices as ``echoes``, or None to leave the
+            macroscopic gradient in the fit.
+        min_factor: Floor below which the dephasing correction is refused.
 
     Returns:
         A :class:`~lightprep.decay.base.DecayResult`.
@@ -171,7 +228,12 @@ def loglinear(
         raise ValueError(f"{len(echoes)} echoes but {len(te)} echo times")
 
     signal = np.column_stack([_read_surface_mean(e) for e in echoes])
-    s0, t2s, r2, valid = fit_arrays(signal, te, weighted=weighted)
+    s0, t2s, r2, valid = fit_arrays(
+        signal, te, weighted=weighted, dephasing=dephasing, min_factor=min_factor
+    )
+    n_refused = None
+    if dephasing is not None:
+        n_refused = int(refused_mask(dephasing, min_factor).sum())
 
     out_prefix = Path(out_prefix)
     t2_path = _write_shape(t2s, out_prefix.with_name(out_prefix.name + "_T2starmap.shape.gii"))
@@ -187,5 +249,6 @@ def loglinear(
         echo_times=te,
         n_vertices=int(signal.shape[0]),
         n_invalid=int((~valid).sum()),
-        method="loglinear",
+        method="loglinear" if dephasing is None else "loglinear+macroscopic",
+        n_dephasing_refused=n_refused,
     )

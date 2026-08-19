@@ -201,8 +201,8 @@ REF_STABLE = "stable"
 
 #: ``ref`` value asking for a groupwise target: the average of the corrected
 #: series, rebuilt from the original data each round. See
-#: :func:`template_reference`.
-REF_TEMPLATE = "template"
+#: :func:`groupwise_reference`.
+REF_GROUPWISE = "groupwise"
 
 #: Frames of recent history a seed volume is asked to have been quiet through.
 #: A movement disturbs more than the frame it happens in: the spins carry the
@@ -212,30 +212,30 @@ REF_TEMPLATE = "template"
 #: recovery, short enough that a run still offers candidates.
 SEED_HISTORY = 6
 
-#: Most of a run the template selection may discard. Every frame is still
+#: Most of a run the frame selection may discard. Every frame is still
 #: estimated and still corrected -- this bounds what the *target* is built from,
 #: not what comes out. A parameter rather than a constant because the right
 #: value is a property of the dataset: a cohort that barely moves should not be
 #: halved to match one that does.
-TEMPLATE_MAX_DROP = 0.5
+SELECT_MAX_DROP = 0.5
 
 #: Flag a run for review when the three selection scores agree this well about
 #: which frames to reject. They are near-independent on a sound run -- 0.04-0.08
 #: mean pairwise Jaccard here -- so consistent agreement means the badness is
 #: real and more widespread than the ceiling can remove. Not a reason to drop
 #: the run automatically; a reason for someone to look at it.
-TEMPLATE_AGREEMENT = 0.25
+GROUPWISE_AGREEMENT = 0.25
 
 #: Voxels of dilation on the mask used for the intensity score. The brain/air
 #: boundary is where motion produces the largest intensity change, so a mask
 #: tight to the brain excludes exactly the voxels carrying the signal. The
 #: geometric score gets the *undilated* mask -- there the mask only sets a
 #: second moment, and padding it just lengthens the rotational lever arm.
-TEMPLATE_DILATE = 2
+GROUPWISE_DILATE = 2
 
-#: Cap on template rounds. The loop's real stopping rule is the kept set
+#: Cap on groupwise rounds. The loop's real stopping rule is the kept set
 #: repeating; this only bounds the damage if two sets alternate forever.
-TEMPLATE_MAX_ROUNDS = 8
+GROUPWISE_MAX_ROUNDS = 8
 
 
 def relative_motion(volume, out=None) -> np.ndarray:
@@ -540,7 +540,7 @@ def centre_pulls(pulls, mean_pose) -> np.ndarray:
 
         sum_t || (A_t G) z_i - M z_i ||^2 = sum_t || A_t x_i - (M M*) x_i ||^2
 
-    which is minimised at ``M = I``. This is what stops a groupwise template
+    which is minimised at ``M = I``. This is what stops a groupwise reference
     inheriting the arbitrary pose of whichever volume seeded the first round.
     """
     inverse = np.linalg.inv(np.asarray(mean_pose, dtype=np.float64))
@@ -605,7 +605,7 @@ def _flags_at(order, k: int, n: int):
     return {name: np.isin(np.arange(n), o[:k]) for name, o in order.items()}
 
 
-def select_frames(scores, max_drop: float = TEMPLATE_MAX_DROP):
+def select_frames(scores, max_drop: float = SELECT_MAX_DROP):
     """Keep the frames no score condemns, dropping as few as the scores allow.
 
     Every score is "bigger is worse" and each condemns its own worst ``k``
@@ -774,10 +774,10 @@ def _cdtm_values(corrected, mask):
     return np.asarray(cdtm(corrected, mask=mask).values, dtype=np.float64)
 
 
-def template_reference(echo, out_dir, *, seed=None,
-                       max_drop: float = TEMPLATE_MAX_DROP,
-                       dilate: int = TEMPLATE_DILATE,
-                       max_rounds: int = TEMPLATE_MAX_ROUNDS,
+def groupwise_reference(echo, out_dir, *, seed=None,
+                       max_drop: float = SELECT_MAX_DROP,
+                       dilate: int = GROUPWISE_DILATE,
+                       max_rounds: int = GROUPWISE_MAX_ROUNDS,
                        history: int = SEED_HISTORY, interp: str = "cubic",
                        mask=None, work=None) -> Path:
     """Build a groupwise registration target: the average of the best frames.
@@ -822,7 +822,7 @@ def template_reference(echo, out_dir, *, seed=None,
       ``echo`` with a composed transform, never by resampling the previous
       round's output, so the target carries exactly one interpolation however
       many rounds run.
-    * **Put the target on the mean pose.** Otherwise the template keeps the
+    * **Put the target on the mean pose.** Otherwise the reference keeps the
       pose of whatever volume seeded round 0, and the series is corrected to an
       arbitrary position rather than a central one.
 
@@ -832,15 +832,15 @@ def template_reference(echo, out_dir, *, seed=None,
     Args:
         echo: The series to build the target from -- the same echo motion will
             be estimated on.
-        out_dir: Where ``reference.nii.gz``, ``template_frames.npy`` (the final
-            kept set) and ``template_cdtm.npy`` (the final distances) go.
+        out_dir: Where ``reference.nii.gz``, ``boldref_frames.npy`` (the final
+            kept set) and ``boldref_cdtm.npy`` (the final distances) go.
         seed: Volume to aim round 0 at. ``None`` measures the run and asks
             :func:`quiet_reference`; an int forces one.
         max_drop: Ceiling on the fraction of frames the selection may discard.
-            See :data:`TEMPLATE_MAX_DROP` and :func:`select_frames`.
+            See :data:`SELECT_MAX_DROP` and :func:`select_frames`.
         dilate: Voxels of dilation on the mask used for the intensity score
-            only. See :data:`TEMPLATE_DILATE`.
-        max_rounds: Safety cap. See :data:`TEMPLATE_MAX_ROUNDS`.
+            only. See :data:`GROUPWISE_DILATE`.
+        max_rounds: Safety cap. See :data:`GROUPWISE_MAX_ROUNDS`.
         history: Recent-history window for the seed. See :data:`SEED_HISTORY`.
         interp: Interpolation used to build the average, one of
             :data:`INTERPOLATIONS`. Defaults to the sharpest rather than to
@@ -854,12 +854,12 @@ def template_reference(echo, out_dir, *, seed=None,
         work: Scratch directory. A temporary one is used and removed if omitted.
 
     Returns:
-        Path to the template, on ``echo``'s voxel grid -- which is what
+        Path to the boldref, on ``echo``'s voxel grid -- which is what
         ``-moco -ref`` requires of an image reference.
 
     Warns:
         UserWarning: If the kept set is still changing at ``max_rounds``, or if
-            it settles into a cycle rather than a fixed point. The template is
+            it settles into a cycle rather than a fixed point. The reference is
             still returned; it is the last one built.
 
     Note:
@@ -871,7 +871,7 @@ def template_reference(echo, out_dir, *, seed=None,
     """
     if not supports_ref():
         raise RuntimeError(
-            "a template reference needs niimath with '-moco -ref <n|img>'; "
+            "a groupwise reference needs niimath with '-moco -ref <n|img>'; "
             "this build has no -ref, so there is no way to fit onto an image"
         )
     if not 0.0 < max_drop < 1.0:
@@ -903,7 +903,7 @@ def template_reference(echo, out_dir, *, seed=None,
                 f"seed volume {index} is out of range for {n_volumes} volumes"
             )
 
-        # The output grid never changes: every template lives on the input's
+        # The output grid never changes: every reference image lives on the input's
         # voxel grid, and the pose lives in the transforms. Keeping it fixed is
         # also what stops a round from overwriting the image it is resampling
         # onto.
@@ -911,12 +911,12 @@ def template_reference(echo, out_dir, *, seed=None,
         niimath(echo, "-crop", index, 1, grid)
 
         frames = list(split_frames(echo, work / "frames", prefix="vol"))
-        target, template = str(index), out_dir / "reference.nii.gz"
+        target, boldref = str(index), out_dir / "reference.nii.gz"
         seen, keep, values = [], None, None
 
         for round_index in range(max_rounds):
             pulls, corrected = _estimate_pulls(echo, target, work, n_volumes,
-                                               f"template{round_index}")
+                                               f"groupwise{round_index}")
             if mask is None:
                 from ..qc.motion import brain_mask
                 try:
@@ -938,7 +938,7 @@ def template_reference(echo, out_dir, *, seed=None,
                     mask = vol > np.percentile(vol[vol > 0], 40.0)
                 dilated = ndimage.binary_dilation(mask, iterations=dilate)
 
-            geom = brain_geometry(template if round_index else grid, mask=mask)
+            geom = brain_geometry(boldref if round_index else grid, mask=mask)
             scores = {
                 "within_tr": within_tr_motion(echo, index, *geom,
                                               work / f"wtr{round_index}"),
@@ -950,14 +950,14 @@ def template_reference(echo, out_dir, *, seed=None,
             keep, fraction, flags, agreement = select_frames(
                 scores, max_drop=max_drop)
             values = scores
-            if agreement > TEMPLATE_AGREEMENT:
+            if agreement > GROUPWISE_AGREEMENT:
                 warnings.warn(
                     f"{Path(echo).name}: within-TR motion, between-TR motion and "
                     f"CDTM agree on {100 * agreement:.0f}% of the frames they "
                     f"reject (typical is under "
-                    f"{100 * TEMPLATE_AGREEMENT:.0f}%). The selection still "
+                    f"{100 * GROUPWISE_AGREEMENT:.0f}%). The selection still "
                     f"kept {100 * keep.mean():.0f}% because that is the "
-                    f"ceiling, so the template is being built partly from bad "
+                    f"ceiling, so the reference is being built partly from bad "
                     f"frames -- this run wants a look.",
                     stacklevel=2)
 
@@ -968,7 +968,7 @@ def template_reference(echo, out_dir, *, seed=None,
             if packed in seen:
                 if packed != (seen[-1] if seen else None):
                     warnings.warn(
-                        f"template selection cycled rather than converging after "
+                        f"frame selection cycled rather than converging after "
                         f"{round_index + 1} rounds; using the last average",
                         stacklevel=2,
                     )
@@ -977,20 +977,20 @@ def template_reference(echo, out_dir, *, seed=None,
 
             pulls = centre_pulls(pulls, frechet_mean_pose(pulls, *geom[:2],
                                                           weights=keep.astype(float)))
-            _write_average(frames, pulls, keep, grid, template, work, interp)
-            target = str(template)
+            _write_average(frames, pulls, keep, grid, boldref, work, interp)
+            target = str(boldref)
         else:
             warnings.warn(
-                f"template selection had not converged after {max_rounds} rounds; "
+                f"frame selection had not converged after {max_rounds} rounds; "
                 f"using the last average",
                 stacklevel=2,
             )
 
-        np.save(out_dir / "template_frames.npy", keep)
+        np.save(out_dir / "boldref_frames.npy", keep)
         for name, score in values.items():
-            np.save(out_dir / f"template_{name}.npy", np.asarray(score))
+            np.save(out_dir / f"boldref_{name}.npy", np.asarray(score))
 
-    return template
+    return boldref
 
 
 def _write_average(frames, pulls, keep, grid: Path, out: Path, work: Path,
@@ -1028,7 +1028,7 @@ def _write_average(frames, pulls, keep, grid: Path, out: Path, work: Path,
         used += 1
 
     if not used:
-        raise RuntimeError("every frame was excluded from the template average")
+        raise RuntimeError("every frame was excluded from the reference average")
     average = total / used * float(np.mean(scales))
     nib.save(nib.Nifti1Image(average.astype(np.float32), grid_img.affine,
                              grid_img.header), out)
@@ -1109,7 +1109,7 @@ def moco(
     ref="middle",
     ref_echo: int = 0,
     interp: str = "linear",
-    template_mask=None,
+    groupwise_mask=None,
     keep_workdir: bool = False,
 ) -> HMCResult:
     """Estimate head motion on one echo and apply it to every echo.
@@ -1128,8 +1128,8 @@ def moco(
         ref: Registration target. ``"middle"`` (default) uses the middle
             volume, ``"stable"`` the volume that moved least from both of its
             neighbours (measured first by :func:`stable_reference`, a few
-            seconds), ``"template"`` a groupwise average of the corrected
-            series built by :func:`template_reference` (several times the cost,
+            seconds), ``"groupwise"`` a groupwise average of the corrected
+            series built by :func:`groupwise_reference` (several times the cost,
             and the only option whose result does not depend on picking a
             volume), ``"mean"`` the mean volume -- which is *not* the same
             thing, being an average of the series as acquired, motion and all
@@ -1148,8 +1148,8 @@ def moco(
             uses internally (an 8-tap Lagrange): its own corrected output is
             discarded, so that every echo is resampled once, the same way, by
             the same call.
-        template_mask: Only for ``ref="template"``: a brain mask to score
-            frames in, passed through to :func:`template_reference`. Omitted,
+        groupwise_mask: Only for ``ref="groupwise"``: a brain mask to score
+            frames in, passed through to :func:`groupwise_reference`. Omitted,
             it is derived from the data.
         keep_workdir: Keep the per-frame volumes, the ``.1D`` file and the
             reconstructed JSON transforms.
@@ -1215,13 +1215,13 @@ def moco(
     if isinstance(ref, str) and ref == REF_STABLE:
         ref, relative = stable_reference(paths[ref_echo], work / "relative.1D")
         save_trace(relative, out_dir / "relative_fd.txt")
-    elif isinstance(ref, str) and ref == REF_TEMPLATE:
+    elif isinstance(ref, str) and ref == REF_GROUPWISE:
         # Build the target out of the data first. This estimates the series a
         # couple of extra times; the pass below then re-estimates against the
-        # finished template, so what is returned was fitted to it and not to
+        # finished boldref, so what is returned was fitted to it and not to
         # some intermediate.
-        ref = template_reference(paths[ref_echo], out_dir, work=work / "template",
-                                 mask=template_mask)
+        ref = groupwise_reference(paths[ref_echo], out_dir, work=work / "groupwise",
+                                 mask=groupwise_mask)
 
     # -bin, where it exists, is what keeps the estimate in float64: the -1Dfile
     # text is AFNI's frozen %8.4f layout, so without it every transform below
@@ -1268,7 +1268,7 @@ def moco(
                     "-applymat", work / f"xfm{t:04d}.json",
                     "-final", interp, out)
             corrected.append(out)
-        merge_frames(corrected, dst, template=src)
+        merge_frames(corrected, dst, boldref=src)
 
     par = save_trace(parameters, out_dir / "motion.par")
 
