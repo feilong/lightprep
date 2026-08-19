@@ -219,11 +219,19 @@ SEED_HISTORY = 6
 #: halved to match one that does.
 SELECT_MAX_DROP = 0.5
 
-#: Flag a run for review when the three selection scores agree this well about
-#: which frames to reject. They are near-independent on a sound run -- 0.04-0.08
-#: mean pairwise Jaccard here -- so consistent agreement means the badness is
-#: real and more widespread than the ceiling can remove. Not a reason to drop
-#: the run automatically; a reason for someone to look at it.
+#: Flag a run for review when the selection scores agree this well about which
+#: frames to reject. Motion and CDTM see different failures -- one cannot see a
+#: spike or a dropped slice, the other cannot see a volume that is smeared but
+#: still looks like the run -- so on a sound run they overlap little and the
+#: rule spends its budget on frames that are merely each score's worst. Agreeing
+#: means the badness is real and more widespread than the ceiling can remove.
+#:
+#: Not a reason to drop a run automatically; a reason for someone to look at it.
+#: Measured on two scores: 0.17 on a clean run against 0.70 on the worst one
+#: here. (On three scores the same runs gave 0.04-0.08 against 0.53 -- the
+#: statistic moves with the number of scores, so it is not transferable.) Two
+#: runs is thin evidence for where between 0.17 and 0.70 the line belongs;
+#: treat it as provisional until swept across a cohort.
 GROUPWISE_AGREEMENT = 0.25
 
 #: Voxels of dilation on the mask used for the intensity score. The brain/air
@@ -547,6 +555,32 @@ def centre_pulls(pulls, mean_pose) -> np.ndarray:
     return np.asarray(pulls, dtype=np.float64) @ inverse
 
 
+
+def _strip_or_threshold(image):
+    """MindGrab a volume, falling back to an intensity cut if it will not run.
+
+    The workflow has to keep going without a person watching. The fallback is
+    measurably worse -- an intensity cut keeps a fixed fraction of the field of
+    view rather than the brain, a 71mm RMS radius against 50-54mm for a real
+    mask, which lengthens the lever arm every rotation is weighted by and
+    inflated a rotation-heavy run's scores by 28% when measured. So it warns,
+    and it is built here rather than left as None, which would only send the
+    next caller back to the extraction that just failed.
+    """
+    from ..qc.motion import brain_mask
+    try:
+        return brain_mask(image)
+    except (RuntimeError, DependencyError) as exc:              # noqa: BLE001
+        warnings.warn(
+            f"brain extraction failed on {Path(image).name} ({exc}); falling "
+            f"back to an intensity threshold. Treat this run's motion scores "
+            f"as approximate.", stacklevel=3)
+        vol = np.asarray(nib.load(str(image)).dataobj, dtype=np.float64)
+        if vol.ndim > 3:
+            vol = vol[..., 0]
+        return vol > np.percentile(vol[vol > 0], 40.0)
+
+
 def _estimate_pulls(echo: Path, ref_arg: str, work: Path, n_volumes: int,
                     tag: str):
     """``(pulls, corrected series)`` from one ``-moco`` pass.
@@ -806,6 +840,42 @@ def neighbour_motion(steps) -> np.ndarray:
     return local
 
 
+
+def window_rms(steps, history: int = SEED_HISTORY) -> np.ndarray:
+    """RMS of the steps over ``[t - history, t + 1]``, per frame.
+
+    The neighbourhood a *reference* wants, which is not the one a frame wants.
+    A frame is judged on its immediate neighbours (:func:`neighbour_motion`) --
+    was it smeared. A reference is judged on a stretch, because a movement
+    disturbs the spin history for several TR afterwards, so a volume acquired
+    shortly after one is wrong in a way no rigid transform undoes even if it
+    sits in a momentary lull.
+
+    RMS over the window rather than a mean, to stay in quadrature with
+    everything else these scores are combined with.
+
+    Args:
+        steps: Frame-to-frame motion; entry ``t`` is the step into ``t``, and
+            entry 0 is a placeholder excluded from every window.
+        history: Frames of recent past the window covers.
+
+    Returns:
+        ``(n_frames,)``, infinite where a full window is not available so that
+        an argmin cannot pick an edge on partial evidence.
+    """
+    d = np.asarray(steps, dtype=np.float64).ravel()
+    width = history + 2
+    out = np.full(d.size, np.inf)
+    if d.size < width + 1:
+        return out
+    power = np.convolve(d ** 2, np.ones(width) / width, mode="valid")
+    # power[k] covers d[k : k+width], the window for t = k + history; k starts
+    # at 1 so the placeholder d[0] never enters one.
+    for k in range(1, len(power)):
+        out[k + history] = np.sqrt(power[k])
+    return out
+
+
 def _cdtm_values(corrected, mask):
     """Per-frame correlation distance to the run's iteratively refined mean.
 
@@ -824,7 +894,8 @@ def groupwise_reference(echo, out_dir, *, seed=None,
                        max_drop: float = SELECT_MAX_DROP,
                        dilate: int = GROUPWISE_DILATE,
                        max_rounds: int = GROUPWISE_MAX_ROUNDS,
-                       history: int = SEED_HISTORY, interp: str = "cubic",
+                       history: int = SEED_HISTORY, interleaved: bool = True,
+                       interp: str = "cubic",
                        mask=None, work=None) -> Path:
     """Build a groupwise registration target: the average of the best frames.
 
@@ -888,6 +959,12 @@ def groupwise_reference(echo, out_dir, *, seed=None,
             only. See :data:`GROUPWISE_DILATE`.
         max_rounds: Safety cap. See :data:`GROUPWISE_MAX_ROUNDS`.
         history: Recent-history window for the seed. See :data:`SEED_HISTORY`.
+        interleaved: Whether slices are acquired interleaved, so that the odd
+            and even stacks sample different halves of the TR and within-TR
+            motion is measurable. False for a sequential acquisition, where the
+            two stacks are acquired together and the split measures nothing:
+            the motion criterion then reduces to the between-TR term. Read it
+            from SliceTiming rather than assuming.
         interp: Interpolation used to build the average, one of
             :data:`INTERPOLATIONS`. Defaults to the sharpest rather than to
             ``moco``'s output kernel: blur in a target propagates into every
@@ -936,57 +1013,62 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         work = Path(work)
         work.mkdir(parents=True, exist_ok=True)
 
-        # 0. Seed from the raw series, before anything has been registered.
-        #
-        # TODO: this scores the seed on Power FD alone, which is the one place
-        # left using a different metric from everything downstream. Two changes
-        # belong here:
-        #
-        #   * :func:`relative_rms` instead of :func:`relative_displacement`, so
-        #     the seed is chosen in the same units the frames are later judged
-        #     in -- RMS tissue displacement against the subject's own inertia
-        #     tensor, not an assumed 50mm sphere. Needs a mask, which does not
-        #     exist yet at this point; the corrected series that
-        #     :func:`~lightprep.qc.motion.brain_mask` wants comes out of round
-        #     0. Stripping the raw series directly is the obvious answer.
-        #
-        #   * within-TR motion averaged with the between-TR value, so a seed
-        #     that is quiet between frames but smeared inside them stops
-        #     winning. The two are near-independent -- rho ~ 0.08 across a
-        #     clean cohort -- so this is real extra information, not a
-        #     re-weighting of what FD already says.
-        #
-        # Two things make it more than a substitution. :func:`within_tr_motion`
-        # takes a reference TR, which is precisely what this step is choosing,
-        # so the reference-free construction is wanted instead: interpolate
-        # both slice stacks back to the full z grid, sequence them in
-        # acquisition order (O_0 E_0 O_1 E_1 ...) and read the odd rows of
-        # ``-moco -relative``. Measured, that costs about 3x the noise floor of
-        # the reference-based estimator -- 0.021mm against 0.0075mm -- while
-        # staying well under the 0.054mm it is trying to resolve.
-        #
-        # And it only applies to an interleaved acquisition. A sequential one
-        # has no odd/even split to exploit, so the within-TR term has to be
-        # dropped rather than computed wrongly; read SliceTiming and decide.
-        # Frame-to-frame motion is a property of the data, not of whatever is
-        # being registered to, so one pass serves the seed and every round's
-        # between-TR score. Fitting each pair directly also beats differencing
-        # two fits against a common target, which inherits the error of both.
+        # 0a. A first reference on Power FD alone. It is the one score that
+        # needs no mask, which is the whole reason it goes first: everything
+        # better is measured in RMS tissue displacement, and that needs to know
+        # what the brain is.
         steps = relative_motion(echo, work / "relative.1D")
-        relative = relative_displacement(steps)
-        save_trace(relative, out_dir / "relative_fd.txt")
-        index = quiet_reference(relative, history=history) if seed is None else int(seed)
-        if not 0 <= index < n_volumes:
+        save_trace(relative_displacement(steps), out_dir / "relative_fd.txt")
+        first = (quiet_reference(relative_displacement(steps), history=history)
+                 if seed is None else int(seed))
+        if not 0 <= first < n_volumes:
             raise ValueError(
-                f"seed volume {index} is out of range for {n_volumes} volumes"
-            )
+                f"seed volume {first} is out of range for {n_volumes} volumes")
+        first_vol = work / "first.nii.gz"
+        niimath(echo, "-crop", first, 1, first_vol)
 
-        # The output grid never changes: every reference image lives on the input's
-        # voxel grid, and the pose lives in the transforms. Keeping it fixed is
-        # also what stops a round from overwriting the image it is resampling
-        # onto.
+        # 0b. Strip that one volume for the mask. A single EPI frame is noisier
+        # than the multi-frame mean brain_mask would normally take, but the mask
+        # is only ever consumed as a second moment, and the noise averages out
+        # of that: measured against the 20-frame mask, Dice 0.96-0.995 and RMS
+        # radius within 0.4mm. On a run that moves it is the better of the two,
+        # a temporal mean there being a smeared union of head positions.
+        mask = _strip_or_threshold(first_vol)
+        first_geom = brain_geometry(first_vol, mask=mask)
+
+        # 0c. Now the honest scores, and a second reference chosen on both:
+        # quiet through a stretch (spin history takes several TR to recover)
+        # AND quiet within itself. within-TR is measured against `first`, so it
+        # carries that frame's own within-TR motion -- small if `first` is
+        # quiet, which is what picking it on FD was for.
+        between = relative_rms(steps, first_vol, mask=mask)
+        within = (within_tr_motion(echo, first, *first_geom, work / "within_tr")
+                  if interleaved else None)
+        stretch = window_rms(between, history)
+        index = int(np.argmin(stretch if within is None
+                              else combine_rms(stretch, within))) \
+            if seed is None else first
+
+        # 0d. The reference everything is registered to, and its own mask. The
+        # brain sits differently in this frame than in `first`, so the geometry
+        # is re-derived here rather than carried over.
         grid = work / "seed.nii.gz"
         niimath(echo, "-crop", index, 1, grid)
+        mask = _strip_or_threshold(grid)
+        dilated = ndimage.binary_dilation(mask, iterations=dilate)
+        geom = brain_geometry(grid, mask=mask)
+        # One motion criterion, not two. Within-TR and between-TR are the same
+        # quantity over different intervals -- RMS tissue displacement -- so
+        # they belong in quadrature rather than as rival votes, and a run that
+        # moves both ways should not be condemned twice for it.
+        #
+        # It also makes a sequential acquisition a special case of nothing.
+        # There is no odd/even split to exploit, so the motion score is simply
+        # the between-TR term and the rest of the loop does not notice.
+        between_local = neighbour_motion(relative_rms(steps, grid, mask=mask))
+        detail = {"within_tr": within, "between_tr": between_local}
+        motion = {"motion": (between_local if within is None
+                             else combine_rms(within, between_local))}
 
         frames = list(split_frames(echo, work / "frames", prefix="vol"))
         target, boldref = str(index), out_dir / "reference.nii.gz"
@@ -995,46 +1077,6 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         for round_index in range(max_rounds):
             pulls, corrected = _estimate_pulls(echo, target, work, n_volumes,
                                                f"groupwise{round_index}")
-            if mask is None:
-                from ..qc.motion import brain_mask
-                try:
-                    mask = brain_mask(corrected)
-                except (RuntimeError, DependencyError) as exc:
-                    # The workflow has to keep going without a person watching,
-                    # but the fallback is measurably worse -- an intensity cut
-                    # keeps a fixed fraction of the FOV rather than the brain,
-                    # giving a 71mm RMS radius against 50-54mm for a real mask,
-                    # which inflates every rotation. Say so loudly, and build it
-                    # here rather than leaving it None: None would send CDTM
-                    # back to the extraction that just failed.
-                    warnings.warn(
-                        f"brain extraction failed ({exc}); falling back to an "
-                        f"intensity threshold. Treat this run's motion scores "
-                        f"as approximate.", stacklevel=2)
-                    vol = np.asarray(nib.load(str(corrected)).dataobj[..., 0],
-                                     dtype=np.float64)
-                    mask = vol > np.percentile(vol[vol > 0], 40.0)
-                dilated = ndimage.binary_dilation(mask, iterations=dilate)
-
-                # Undilated for anything geometric: there the mask sets a second
-                # moment, and padding it only lengthens the rotational lever arm.
-                # Every reference image sits on the input's grid, so this does
-                # not change from round to round either.
-                geom = brain_geometry(grid, mask=mask)
-
-                # Neither motion score depends on what is being registered to.
-                # within-TR fits each slice stack to a fixed TR of the input;
-                # between-TR fits neighbouring input frames to each other. Both
-                # are properties of the data, so they are measured once and
-                # reused -- recomputing them per round would repeat two -moco
-                # passes to arrive at the same numbers.
-                motion = {
-                    "within_tr": within_tr_motion(echo, index, *geom,
-                                                  work / "within_tr"),
-                    "between_tr": neighbour_motion(
-                        relative_rms(steps, grid, mask=mask)),
-                }
-
             # CDTM is the one score read off the corrected series, so it is
             # the only one recomputed per round -- and it is not read once but
             # iterated, because the reference it scores against is built from
@@ -1066,8 +1108,8 @@ def groupwise_reference(echo, out_dir, *, seed=None,
 
             if agreement > GROUPWISE_AGREEMENT:
                 warnings.warn(
-                    f"{Path(echo).name}: within-TR motion, between-TR motion and "
-                    f"CDTM agree on {100 * agreement:.0f}% of the frames they "
+                    f"{Path(echo).name}: the motion and CDTM scores agree on "
+                    f"{100 * agreement:.0f}% of the frames they "
                     f"reject (typical is under "
                     f"{100 * GROUPWISE_AGREEMENT:.0f}%). The selection still "
                     f"kept {100 * keep.mean():.0f}% because that is the "
@@ -1106,8 +1148,13 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         # the rule to re-read.
         np.save(out_dir / "boldref_frames.npy", keep)
         np.save(out_dir / "boldref_cdtm.npy", np.asarray(values))
-        for name, score in motion.items():
-            np.save(out_dir / f"boldref_{name}.npy", np.asarray(score))
+        np.save(out_dir / "boldref_motion.npy", np.asarray(motion["motion"]))
+        # The two terms behind the motion score, so a reader can see which of
+        # them condemned a frame. Absent for a sequential acquisition, where
+        # there is no within-TR term to separate out.
+        for name, score in detail.items():
+            if score is not None:
+                np.save(out_dir / f"boldref_{name}.npy", np.asarray(score))
 
     return boldref
 
