@@ -761,6 +761,18 @@ def step_motion(pulls, centroid, moment, count) -> np.ndarray:
 
 
 
+
+def combine_rms(*scores) -> np.ndarray:
+    """Combine RMS displacement scores in quadrature.
+
+    ``sqrt(mean(d_i^2))`` -- the RMS over the pooled displacements, so the
+    result stays an RMS. Use wherever two of these are being weighed together:
+    the steps either side of a frame, or within-TR against between-TR motion.
+    """
+    stack = np.vstack([np.asarray(s, dtype=np.float64).ravel() for s in scores])
+    return np.sqrt((stack ** 2).mean(axis=0))
+
+
 def neighbour_motion(steps) -> np.ndarray:
     """Per-frame local motion: the mean of the step into a frame and out of it.
 
@@ -770,10 +782,17 @@ def neighbour_motion(steps) -> np.ndarray:
     surely as the reverse -- so scoring a frame by the step *into* it alone
     misses half the cases.
 
-    The mean rather than the sum only because it keeps the score in the same
-    millimetres as the steps; for a rank-based selection the two are identical.
-    The first and last frames have one neighbour each and take that step
-    unhalved, which is the same quantity, not a special case.
+    Combined in quadrature, not arithmetically. Each step is already an RMS
+    over voxels, so ``sqrt((a^2 + b^2)/2)`` is the RMS over both of them pooled
+    and the result is still an RMS of something; an arithmetic mean is not.
+    It also behaves better here: by AM-QM the quadratic mean is the larger, and
+    by more the further the two steps disagree, so a frame flanked by one still
+    neighbour and one lurch scores closer to the lurch. One movement
+    compromises a frame whatever the other side was doing.
+
+    Unlike sum against mean, this changes the ranking, so it is a real choice
+    and not a scaling. The first and last frames have one neighbour each and
+    take that step as it stands.
     """
     steps = np.asarray(steps, dtype=np.float64).ravel()
     n = steps.size
@@ -783,7 +802,7 @@ def neighbour_motion(steps) -> np.ndarray:
     local[0] = steps[1]
     local[-1] = steps[-1]
     if n > 2:
-        local[1:-1] = (steps[1:-1] + steps[2:]) / 2.0
+        local[1:-1] = np.sqrt((steps[1:-1] ** 2 + steps[2:] ** 2) / 2.0)
     return local
 
 
@@ -1016,14 +1035,35 @@ def groupwise_reference(echo, out_dir, *, seed=None,
                         relative_rms(steps, grid, mask=mask)),
                 }
 
-            # Only CDTM moves between rounds: it scores frames against the
-            # corrected series, which is the one thing the reference changes.
-            scores = dict(motion,
-                          cdtm=np.asarray(_cdtm_values(corrected, dilated),
-                                          dtype=np.float64))
-            keep, fraction, flags, agreement = select_frames(
-                scores, max_drop=max_drop)
-            values = scores
+            # CDTM is the one score read off the corrected series, so it is
+            # the only one recomputed per round -- and it is not read once but
+            # iterated, because the reference it scores against is built from
+            # the very frames being chosen.
+            #
+            # The frames feeding that reference are the *jointly* selected
+            # ones, not CDTM's own survivors. A frame acquired while the head
+            # moved is smeared and mispositioned however much it still
+            # resembles the run, and averaging it into the yardstick blurs the
+            # yardstick -- which then correlates acceptably with everything and
+            # flattens the very discrimination CDTM exists to provide.
+            #
+            # It starts from a motion-only selection: within-TR and between-TR
+            # are known before any CDTM exists, so the first reference is
+            # already clear of the worst frames.
+            from ..qc.motion import correlation_distance, masked_series
+            series = masked_series(corrected, dilated)
+            keep = select_frames(motion, max_drop=max_drop)[0]
+            values = fraction = flags = agreement = None
+            for _ in range(GROUPWISE_MAX_ROUNDS):
+                values = correlation_distance(series, keep)
+                scores = dict(motion, cdtm=np.nan_to_num(values, nan=np.inf))
+                chosen, fraction, flags, agreement = select_frames(
+                    scores, max_drop=max_drop)
+                if np.array_equal(chosen, keep):
+                    break
+                keep = chosen
+            del series
+
             if agreement > GROUPWISE_AGREEMENT:
                 warnings.warn(
                     f"{Path(echo).name}: within-TR motion, between-TR motion and "
@@ -1060,8 +1100,13 @@ def groupwise_reference(echo, out_dir, *, seed=None,
                 stacklevel=2,
             )
 
+        # The three scores the selection was made on, and the CDTM values as
+        # they stood at the end -- kept raw, with NaN where a frame had no
+        # variance, because these are for a person to look at rather than for
+        # the rule to re-read.
         np.save(out_dir / "boldref_frames.npy", keep)
-        for name, score in values.items():
+        np.save(out_dir / "boldref_cdtm.npy", np.asarray(values))
+        for name, score in motion.items():
             np.save(out_dir / f"boldref_{name}.npy", np.asarray(score))
 
     return boldref

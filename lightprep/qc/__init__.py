@@ -28,13 +28,15 @@ from .surface import (DEFAULT_SURFACE, SurfaceQC, euler_number,
                       flag_outliers, surface_qc)
 from .motion import (DEFAULT_CLIP, DEFAULT_DOWNSAMPLE, FD_RADIUS_MM,
                      brain_mask, dvars, find_niivue, framewise_displacement,
-                     frame_distance, motion_report, quality_index,
+                     correlation_distance, frame_distance, masked_series,
+                     motion_report, quality_index,
                      aqi_outliers, AQI_MAD, cdtm, CDTMResult,
                      CDTM_RATIO, CDTM_TRIM, relative_fd, fd_outliers,
                      FD_THRESHOLD_MM,
                      trimmed_mean, serve)
 
 __all__ = ["motion_report", "serve", "dvars", "frame_distance",
+           "masked_series", "correlation_distance",
            "relative_fd", "fd_outliers", "FD_THRESHOLD_MM",
            "brain_mask", "quality_index", "aqi_outliers", "AQI_MAD",
            "cdtm", "CDTMResult", "CDTM_RATIO", "CDTM_TRIM",

@@ -511,6 +511,69 @@ class CDTMResult:
     converged: bool
 
 
+
+def masked_series(volume, mask) -> np.ndarray:
+    """``(n_voxels, n_frames)`` float64 of a series inside a mask.
+
+    Read once so a selection can be iterated against it without touching disk
+    again -- the frames never change, only which of them the reference is built
+    from.
+    """
+    img = volume if hasattr(volume, "dataobj") else nib.load(str(volume))
+    if img.ndim != 4:
+        raise ValueError(f"need a 4D image, got shape {img.shape}")
+    if isinstance(mask, (str, Path)):
+        mask = np.asanyarray(nib.load(str(mask)).dataobj) > 0
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != img.shape[:3]:
+        raise ValueError(f"mask is {mask.shape} but data is {img.shape[:3]}")
+    return np.stack([np.asanyarray(img.dataobj[..., t], dtype=np.float64)[mask]
+                     for t in range(img.shape[3])], axis=1)
+
+
+def correlation_distance(series, keep=None, trim: float = CDTM_TRIM) -> np.ndarray:
+    """Each frame's correlation distance to the mean of the kept frames.
+
+    The scoring half of :func:`cdtm`, with the choosing half removed. cdtm
+    decides for itself which frames build its reference; this takes that
+    decision from the caller, so a frame can be kept out of the yardstick for
+    reasons correlation cannot see -- it was acquired while the head moved, and
+    is smeared or mispositioned however much it still resembles the run.
+
+    Every frame is scored, including excluded ones: they are judged, not
+    forgotten.
+
+    Args:
+        series: ``(n_voxels, n_frames)`` from :func:`masked_series`.
+        keep: Boolean over frames, the reference set. ``None`` uses the
+            per-voxel trimmed mean of everything, which is the right start when
+            nothing has been excluded yet and the frames that need finding are
+            still in the average.
+        trim: Fraction trimmed when ``keep`` is None.
+
+    Returns:
+        ``(n_frames,)`` correlation distance; bigger is less like the reference.
+    """
+    X = np.asarray(series, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"expected (n_voxels, n_frames), got {X.shape}")
+    n = X.shape[1]
+    if keep is None:
+        avg = trimmed_mean(X, trim, axis=1)
+    else:
+        keep = np.asarray(keep, dtype=bool)
+        if keep.shape != (n,):
+            raise ValueError(f"keep is {keep.shape}, expected ({n},)")
+        if keep.sum() < 2:
+            raise ValueError("the reference needs at least 2 frames")
+        avg = X[:, keep].mean(axis=1)
+    ac = avg - avg.mean()
+    Xc = X - X.mean(axis=0, keepdims=True)
+    denom = np.sqrt((Xc ** 2).sum(axis=0)) * np.sqrt((ac ** 2).sum())
+    return 1.0 - np.divide((Xc * ac[:, None]).sum(axis=0), denom,
+                           out=np.full(n, np.nan), where=denom > 0)
+
+
 def cdtm(volume, mask=None, *, threshold: float | None = None,
          ratio: float = CDTM_RATIO, trim: float = CDTM_TRIM,
          max_iter: int = 20, remask: bool = False, save_reference=None,
