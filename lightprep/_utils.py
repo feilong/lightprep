@@ -35,6 +35,12 @@ def run(cmd: list, extra_env: dict | None = None, *, timeout: float | None = Non
     resolve the executable -- so a caller can point at a toolbox that is not on
     the ambient PATH.
 
+    stdin is always /dev/null. A tool that asks a question in a pipeline has
+    nobody to answer it, and inheriting a live stdin turns that into a hang
+    rather than an error -- brainchop prompts "Optimize now? [y/n]" on its first
+    run per model and blocks in input() forever. Reading EOF instead takes the
+    default and carries on.
+
     ``timeout`` (seconds) and ``retries`` are for tools that occasionally wedge
     rather than fail. A hung child is killed and the command retried from
     scratch; a command that *fails* is not retried, because a non-zero exit is
@@ -52,7 +58,7 @@ def run(cmd: list, extra_env: dict | None = None, *, timeout: float | None = Non
     for attempt in range(retries + 1):
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
-                                  timeout=timeout)
+                                  stdin=subprocess.DEVNULL, timeout=timeout)
         except subprocess.TimeoutExpired:
             if attempt == retries:
                 raise RuntimeError(

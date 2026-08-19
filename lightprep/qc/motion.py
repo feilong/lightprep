@@ -217,9 +217,9 @@ def dvars(volume, mask=None, standardize: bool = True,
 
 
 #: Seconds a MindGrab strip may take before it is treated as wedged. A real
-#: strip is 18-24s on a 2mm EPI, so this is several times the honest cost while
-#: keeping the price of a hang bounded: it wedges often enough when spawned
-#: from a process holding the series that a batch cannot afford 5 minutes a go.
+#: strip is 18-24s on a 2mm EPI. Kept as a backstop rather than a workaround:
+#: the hangs that motivated it were brainchop's first-run "Optimize now? [y/n]"
+#: prompt blocking on an inherited stdin, which run() now closes.
 STRIP_TIMEOUT_S = 120.0
 
 #: How many times a wedged strip is retried. It has always cleared on the next
@@ -271,10 +271,7 @@ def brain_mask(volume, out=None, brainchop: str = "brainchop",
         nib.Nifti1Image(mean_img.astype(np.float32), img.affine).to_filename(ref)
         mask_path = Path(out) if out else tmp / "mask.nii.gz"
         mask_path.parent.mkdir(parents=True, exist_ok=True)
-        # Everything the mean was built from is on disk now, and MindGrab
-        # wedges far more often when spawned from a parent still holding the
-        # series -- alive, zero CPU, never finishing. Drop the references and
-        # collect before handing over.
+        # The mean is on disk; the parent has no reason to keep holding it.
         del sample, mean_img
         gc.collect()
 
