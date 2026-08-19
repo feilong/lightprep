@@ -891,6 +891,37 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         work.mkdir(parents=True, exist_ok=True)
 
         # 0. Seed from the raw series, before anything has been registered.
+        #
+        # TODO: this scores the seed on Power FD alone, which is the one place
+        # left using a different metric from everything downstream. Two changes
+        # belong here:
+        #
+        #   * :func:`relative_rms` instead of :func:`relative_displacement`, so
+        #     the seed is chosen in the same units the frames are later judged
+        #     in -- RMS tissue displacement against the subject's own inertia
+        #     tensor, not an assumed 50mm sphere. Needs a mask, which does not
+        #     exist yet at this point; the corrected series that
+        #     :func:`~lightprep.qc.motion.brain_mask` wants comes out of round
+        #     0. Stripping the raw series directly is the obvious answer.
+        #
+        #   * within-TR motion averaged with the between-TR value, so a seed
+        #     that is quiet between frames but smeared inside them stops
+        #     winning. The two are near-independent -- rho ~ 0.08 across a
+        #     clean cohort -- so this is real extra information, not a
+        #     re-weighting of what FD already says.
+        #
+        # Two things make it more than a substitution. :func:`within_tr_motion`
+        # takes a reference TR, which is precisely what this step is choosing,
+        # so the reference-free construction is wanted instead: interpolate
+        # both slice stacks back to the full z grid, sequence them in
+        # acquisition order (O_0 E_0 O_1 E_1 ...) and read the odd rows of
+        # ``-moco -relative``. Measured, that costs about 3x the noise floor of
+        # the reference-based estimator -- 0.021mm against 0.0075mm -- while
+        # staying well under the 0.054mm it is trying to resolve.
+        #
+        # And it only applies to an interleaved acquisition. A sequential one
+        # has no odd/even split to exploit, so the within-TR term has to be
+        # dropped rather than computed wrongly; read SliceTiming and decide.
         if seed is None:
             relative = relative_displacement(
                 relative_motion(echo, work / "relative.1D"))
