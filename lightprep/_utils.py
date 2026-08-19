@@ -57,3 +57,68 @@ def strip_ext(path: Path) -> str:
         if name.endswith(ext):
             return name[: -len(ext)]
     return Path(path).stem
+
+
+#: Suffix of the authoritative copy of a numeric trace. ``.npy`` rather than a
+#: raw ``.bin`` because it carries its own dtype and shape: a raw dump needs an
+#: out-of-band contract to be read back, and a contract that lives in a
+#: docstring is one a future reader can get wrong.
+TRACE_SUFFIX = ".npy"
+
+
+def save_trace(array, path) -> Path:
+    """Save a numeric trace as float64 ``.npy``, with a text twin beside it.
+
+    The ``.npy`` is the artefact. Text cannot hold a float64 -- ``%.17g``
+    round-trips but is unreadable, anything narrower quietly rounds -- and a
+    trace written by one step is read back by another, so a lossy hop between
+    them is a computation done at less than float64 for no reason.
+
+    The text twin is kept because a motion trace is something people look at:
+    ``head motion.par``, a column pasted into a plot, an eyeball comparison
+    against another tool's output. Nothing in this package parses it when the
+    ``.npy`` is there, so its precision is a display choice rather than a
+    contract, and it is written at a width meant to be read.
+
+    Args:
+        array: The trace. Cast to float64.
+        path: Where the *text* twin goes -- conventionally ``motion.par``. The
+            ``.npy`` takes the same stem.
+
+    Returns:
+        The path to the ``.npy``, which is what a result should carry.
+    """
+    import numpy as np
+
+    array = np.asarray(array, dtype=np.float64)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    binary = path.with_suffix(TRACE_SUFFIX)
+    np.save(binary, array)
+    np.savetxt(path, array, fmt="%.8f", delimiter="  ")
+    return binary
+
+
+def load_trace(path):
+    """Read a trace, preferring the ``.npy`` twin over the text.
+
+    Either twin's path gives the same numbers, so a caller does not have to
+    know which one a result carries. Falling back to the text also means
+    derivatives written before the ``.npy`` existed still load -- at the
+    precision they were written with, which is all there is to recover.
+
+    Args:
+        path: Either twin, or any text file of numbers.
+
+    Returns:
+        A float64 array.
+    """
+    import numpy as np
+
+    path = Path(path)
+    binary = path if path.suffix == TRACE_SUFFIX else path.with_suffix(TRACE_SUFFIX)
+    if binary.exists():
+        return np.load(binary).astype(np.float64, copy=False)
+    if path.suffix == TRACE_SUFFIX:
+        raise FileNotFoundError(path)
+    return np.loadtxt(path).astype(np.float64, copy=False)

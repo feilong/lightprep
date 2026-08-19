@@ -6,8 +6,9 @@ import shutil
 from pathlib import Path
 
 import nibabel as nib
+import numpy as np
 
-from .._utils import run, strip_ext
+from .._utils import run, save_trace, strip_ext
 from .base import HMCResult
 
 INTERPOLATIONS = ("nearestneighbour", "trilinear", "spline", "sinc")
@@ -177,8 +178,12 @@ def mcflirt(
         )
 
     # Keep the estimates next to the outputs, so the workdir can go away.
-    parameters = out_dir / "motion.par"
-    shutil.move(f"{estimate}.par", parameters)
+    text = out_dir / "motion.par"
+    shutil.move(f"{estimate}.par", text)
+    # MCFLIRT's own .par is the only estimate here, so the .npy is a faithful
+    # copy of it rather than a wider one -- but it makes every method's result
+    # carry the same kind of path.
+    parameters = save_trace(np.loadtxt(text), text)
 
     transform_dir = out_dir / "transforms"
     transform_dir.mkdir(exist_ok=True)

@@ -15,7 +15,10 @@ class HMCResult:
         reference: The target volume that motion was estimated against.
         transforms: Per-volume rigid transforms, in acquisition order. One
             series of transforms, shared by every echo.
-        parameters: Six-column motion trace, if the method produces one.
+        parameters: Six-column motion trace, if the method produces one. This
+            is the float64 ``.npy``; a text twin sits beside it under the same
+            stem, for reading rather than parsing. Either can be handed to
+            :func:`lightprep._utils.load_trace`, which prefers the ``.npy``.
             Ordering and units are tool-specific -- see the method's docstring.
         ref_echo: Index of the echo motion was estimated on.
         method: Name of the method that produced this result.

@@ -42,7 +42,7 @@ import numpy as np
 from .._niimath import (FINAL_INTERPS, RIGID_COSTS, WARPS, merge_frames,
                         motion_parameters, niimath, read_savemat, split_frames,
                         world_to_fsl, write_fsl_matrix)
-from .._utils import strip_ext
+from .._utils import save_trace, strip_ext
 from .base import HMCResult
 from .fsl import _check_echoes
 
@@ -129,7 +129,7 @@ def allineate(
     Returns:
         An :class:`~lightprep.hmc.base.HMCResult`. ``transforms`` are FLIRT
         matrices, as MCFLIRT's are, so the two methods are interchangeable
-        downstream. ``parameters`` is a six-column ``motion.par``: rotations
+        downstream. ``parameters`` is a six-column ``motion.npy``: rotations
         (radians) then translations (mm), in MCFLIRT's convention -- see
         :func:`lightprep._niimath.motion_parameters`.
 
@@ -220,8 +220,7 @@ def allineate(
             corrected.append(out)
         merge_frames(corrected, dst, template=src)
 
-    par = out_dir / "motion.par"
-    np.savetxt(par, np.asarray(parameters), fmt="%.8g", delimiter="  ")
+    par = save_trace(parameters, out_dir / "motion.par")
 
     if not keep_workdir:
         shutil.rmtree(work, ignore_errors=True)

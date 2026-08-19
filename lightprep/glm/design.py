@@ -18,6 +18,8 @@ Nuisance regressors, as specified:
 from __future__ import annotations
 
 import numpy as np
+
+from .._utils import load_trace
 from numpy.polynomial.legendre import legval
 
 BLOCK_SECONDS = 20.0
@@ -65,9 +67,10 @@ def motion_regressors(motion_par):
     """6 motion parameters and their temporal derivatives -> (n_frames, 12).
 
     ``motion_par`` is MCFLIRT's ``.par``: rotations (rad) then translations (mm).
-    The derivative is a backward difference, first row zero.
+    The derivative is a backward difference, first row zero. Either twin of the
+    trace may be named -- the float64 ``.npy`` is preferred where it exists.
     """
-    par = np.atleast_2d(np.loadtxt(motion_par))
+    par = np.atleast_2d(load_trace(motion_par))
     if par.shape[1] != 6:
         raise ValueError(f"expected 6 motion columns, got {par.shape[1]}")
     deriv = np.vstack([np.zeros((1, 6)), np.diff(par, axis=0)])
@@ -80,7 +83,7 @@ def framewise_displacement(motion_par, radius_mm=50.0):
     Rotations (radians) are converted to millimetres of arc on a sphere of the
     given radius before summing with the translations.
     """
-    par = np.atleast_2d(np.loadtxt(motion_par)).astype(float)
+    par = np.atleast_2d(load_trace(motion_par))
     d = np.vstack([np.zeros((1, 6)), np.abs(np.diff(par, axis=0))])
     d[:, :3] *= radius_mm                 # rotations rad -> mm of arc
     return d.sum(axis=1)
