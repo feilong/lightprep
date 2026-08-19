@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import warnings
 from pathlib import Path
 
 NIFTI_EXTS = (".nii.gz", ".nii")
@@ -26,12 +27,19 @@ def require(program: str, path: str | None = None) -> str:
     return found
 
 
-def run(cmd: list, extra_env: dict | None = None) -> subprocess.CompletedProcess:
+def run(cmd: list, extra_env: dict | None = None, *, timeout: float | None = None,
+        retries: int = 0) -> subprocess.CompletedProcess:
     """Run an external command, raising with captured output on failure.
 
     ``extra_env`` is merged over the inherited environment, and is used to
     resolve the executable -- so a caller can point at a toolbox that is not on
     the ambient PATH.
+
+    ``timeout`` (seconds) and ``retries`` are for tools that occasionally wedge
+    rather than fail. A hung child is killed and the command retried from
+    scratch; a command that *fails* is not retried, because a non-zero exit is
+    an answer and repeating it only wastes time. Leave ``timeout`` None to wait
+    forever, which is right for anything whose runtime is data-dependent.
     """
     cmd = [str(c) for c in cmd]
     env = dict(os.environ)
@@ -40,14 +48,28 @@ def run(cmd: list, extra_env: dict | None = None) -> subprocess.CompletedProcess
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
     require(cmd[0], path=env.get("PATH"))
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "command failed ({}): {}\n--- stdout ---\n{}\n--- stderr ---\n{}".format(
-                proc.returncode, " ".join(cmd), proc.stdout, proc.stderr
+
+    for attempt in range(retries + 1):
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                                  timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if attempt == retries:
+                raise RuntimeError(
+                    f"command timed out after {timeout}s and {attempt + 1} "
+                    f"attempt(s): {' '.join(cmd)}"
+                ) from None
+            warnings.warn(
+                f"{cmd[0]} timed out after {timeout}s; retrying "
+                f"({attempt + 1}/{retries})", stacklevel=2)
+            continue
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "command failed ({}): {}\n--- stdout ---\n{}\n--- stderr ---\n{}".format(
+                    proc.returncode, " ".join(cmd), proc.stdout, proc.stderr
+                )
             )
-        )
-    return proc
+        return proc
 
 
 def strip_ext(path: Path) -> str:
