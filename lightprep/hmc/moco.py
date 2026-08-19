@@ -30,25 +30,49 @@ piece was checked:
 * the resampling direction is ``out = in . T^-1``, so the pull transform -- the
   one nitransforms and :mod:`lightprep.surface.concat` want -- is ``T^-1``.
 
-``-moco`` also always registers onto volume 0, which ``ref`` would otherwise
-choose. That costs nothing once the transforms exist: re-referencing to any
-frame is composition, ``P'_t = P_t . P_ref^-1``, done here in closed form. A
-reference that is not one of the frames (``"mean"``, or an image of your own)
-takes one extra registration to place it against volume 0.
+The ``-1Dfile`` text is AFNI's frozen ``%8.4f`` layout, parsed downstream by
+column position and so unwidenable, which rounds the fit to 1e-4 degrees and
+1e-4 mm. Every transform here is *rebuilt* from those numbers rather than read
+from a matrix, so that rounding would propagate into the resampling. Where
+niimath offers ``-bin`` this module takes the float64 companion instead and
+never sees the text; :func:`_read_parameters` falls back to it only for older
+binaries.
+
+Which volume everything is fitted to is the other thing this module takes a
+position on. ``-moco`` aims at volume 0 unless told otherwise, and volume 0 is
+a poor default: it is the frame most likely to be disturbed, and a disturbed
+target contaminates every row fitted to it. Where the binary carries ``-ref``
+the target is handed to the estimator, so the fit really is made against it;
+where it does not, re-referencing is still exact as a change of coordinates --
+``P'_t = P_t . P_ref^-1`` -- but the registration underneath remains against
+volume 0, and no composition can undo a bad base.
+
+``ref="stable"`` picks the target from the data rather than by convention.
+:func:`relative_motion` runs ``-moco -relative``, which fits each volume onto
+its predecessor and writes no image, giving raw frame-to-frame displacement
+before anything is corrected; :func:`best_reference` then takes the volume with
+the smallest displacement on *both* sides. It costs a few seconds for a couple
+of hundred frames, and the same measurement doubles as the run's motion trace
+for QC -- one that no choice of reference can flatter.
 """
 
 from __future__ import annotations
 
+import contextlib
 import shutil
+import tempfile
+import warnings
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+from scipy import ndimage
 
 from .._niimath import (FINAL_INTERPS, merge_frames, motion_parameters, niimath,
+                        niimath_path,
                         read_savemat, split_frames, world_to_fsl,
                         write_fsl_matrix, write_savemat)
-from .._utils import strip_ext
+from .._utils import DependencyError, save_trace, strip_ext
 from .base import HMCResult
 from .fsl import _check_echoes
 
@@ -106,6 +130,896 @@ def parameters_to_pull(row, affine, shape) -> np.ndarray:
     return np.linalg.inv(push)
 
 
+def _help_text() -> str:
+    """niimath's own help, for feature detection."""
+    import subprocess
+    try:
+        return subprocess.run([str(niimath_path()), "-h"], capture_output=True,
+                              text=True).stdout
+    except Exception:                                   # noqa: BLE001
+        return ""
+
+
+def supports_ref() -> bool:
+    """Whether the niimath on this machine can estimate onto a chosen target.
+
+    ``-moco -ref`` is recent. Without it, motion can only be estimated against
+    volume 0 and moved onto another reference afterwards -- which changes the
+    coordinate frame and the output grid, but not what the registration was
+    fitted to. That distinction matters when volume 0 is itself a bad frame.
+    """
+    return "-ref <n|img>" in _help_text()
+
+
+def supports_relative() -> bool:
+    """Whether the niimath on this machine can measure frame-to-frame motion.
+
+    ``-moco -relative`` fits each volume onto its *predecessor* and writes
+    nothing but the parameters. It is what :data:`REF_STABLE` is built on.
+    """
+    return "-relative" in _help_text()
+
+
+def supports_bin() -> bool:
+    """Whether this niimath can write the float64 companion to a ``.1D``.
+
+    The ``-1Dfile`` layout is AFNI's, six ``%8.4f`` fields parsed by column
+    position, so it cannot be widened -- it rounds the fit to 1e-4 degrees and
+    1e-4 mm. ``-bin`` writes the unrounded parameters alongside it, and
+    everything here reads those where they exist.
+    """
+    return "-bin adds" in _help_text()
+
+
+def _read_parameters(par_1d: Path, n_volumes: int) -> np.ndarray:
+    """The six-column estimate, at the best precision this niimath wrote it.
+
+    Prefers the ``-bin`` companion -- ``nt * 6`` little-endian float64,
+    row-major, no header -- and falls back to parsing the text, which is all an
+    older binary leaves behind.
+    """
+    companion = Path(str(par_1d) + ".bin")
+    if companion.exists():
+        rows = np.fromfile(companion, dtype="<f8").reshape(-1, 6)
+    else:
+        rows = np.atleast_2d(np.loadtxt(par_1d)).astype(np.float64)
+    if rows.shape != (n_volumes, 6):
+        raise RuntimeError(
+            f"-moco wrote {rows.shape} motion parameters for {n_volumes} volumes"
+        )
+    return rows
+
+
+#: Radius converting rotation to surface displacement, following Power et al.
+#: (2012). Their 50mm is roughly the cortex-to-centre distance, so a radian of
+#: rotation moves cortex by 50mm.
+FD_RADIUS_MM = 50.0
+
+#: ``ref`` value asking for the least-disturbed volume, chosen by a ``-relative``
+#: measurement pass over the raw series before anything is registered.
+REF_STABLE = "stable"
+
+#: ``ref`` value asking for a groupwise target: the average of the corrected
+#: series, rebuilt from the original data each round. See
+#: :func:`template_reference`.
+REF_TEMPLATE = "template"
+
+#: Frames of recent history a seed volume is asked to have been quiet through.
+#: A movement disturbs more than the frame it happens in: the spins carry the
+#: perturbed history for several TR before the steady state recovers, so a
+#: volume acquired shortly after a lurch is wrong in a way no rigid transform
+#: undoes. Six is a few TR at typical timings -- long enough to cover the
+#: recovery, short enough that a run still offers candidates.
+SEED_HISTORY = 6
+
+#: Most of a run the template selection may discard. Every frame is still
+#: estimated and still corrected -- this bounds what the *target* is built from,
+#: not what comes out. A parameter rather than a constant because the right
+#: value is a property of the dataset: a cohort that barely moves should not be
+#: halved to match one that does.
+TEMPLATE_MAX_DROP = 0.5
+
+#: Flag a run for review when the three selection scores agree this well about
+#: which frames to reject. They are near-independent on a sound run -- 0.04-0.08
+#: mean pairwise Jaccard here -- so consistent agreement means the badness is
+#: real and more widespread than the ceiling can remove. Not a reason to drop
+#: the run automatically; a reason for someone to look at it.
+TEMPLATE_AGREEMENT = 0.25
+
+#: Voxels of dilation on the mask used for the intensity score. The brain/air
+#: boundary is where motion produces the largest intensity change, so a mask
+#: tight to the brain excludes exactly the voxels carrying the signal. The
+#: geometric score gets the *undilated* mask -- there the mask only sets a
+#: second moment, and padding it just lengthens the rotational lever arm.
+TEMPLATE_DILATE = 2
+
+#: Cap on template rounds. The loop's real stopping rule is the kept set
+#: repeating; this only bounds the damage if two sets alternate forever.
+TEMPLATE_MAX_ROUNDS = 8
+
+
+def relative_motion(volume, out=None) -> np.ndarray:
+    """Frame-to-frame motion of a series, measured without correcting it.
+
+    Runs ``-moco -relative``, which fits every volume onto the one before it
+    and writes no image. The base of each pair is the *original* predecessor,
+    never a corrected one, so the numbers are raw motion rather than residual
+    drift after a correction -- and each pair is independent of every other.
+
+    This is the honest way to ask how much a subject moved, because it needs no
+    reference volume and so cannot be flattered or punished by the choice of
+    one. Ordinary ``-moco`` fits everything onto a single base, and a base that
+    is itself disturbed contaminates every row it produces.
+
+    Args:
+        volume: A 4D series.
+        out: Where to write the ``.1D`` (and its ``.bin`` companion). A
+            temporary is used and discarded when this is ``None``.
+
+    Returns:
+        ``(n_frames, 6)`` float64: ``(roll, pitch, yaw, dS, dL, dP)`` --
+        degrees counter-clockwise about I-S, R-L and A-P, then millimetres
+        toward Superior, Left and Posterior, the same convention ``-1Dfile``
+        uses. Row 0 is all zeros: volume 0 has no predecessor.
+
+    Raises:
+        RuntimeError: If this niimath cannot measure relative motion, or wrote
+            the wrong number of rows.
+    """
+    if not supports_relative():
+        raise RuntimeError(
+            f"{niimath_path()} has no '-moco -relative'; rebuild niimath from a "
+            "revision that carries it, or choose a reference volume explicitly"
+        )
+
+    volume = Path(volume).resolve()
+    with contextlib.ExitStack() as stack:
+        if out is None:
+            tmp = stack.enter_context(tempfile.TemporaryDirectory())
+            out = Path(tmp) / "relative.1D"
+        out = Path(out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        extra = ["-bin"] if supports_bin() else []
+        niimath(volume, "-moco", "-relative", *extra, out)
+        rows = _read_parameters(out, nib.load(str(volume)).shape[-1])
+    return rows
+
+
+def relative_displacement(rows, radius: float = FD_RADIUS_MM) -> np.ndarray:
+    """Per-frame displacement in mm, from :func:`relative_motion` parameters.
+
+    This is Power framewise displacement, but computed from a fit made
+    *directly* between neighbouring frames rather than by differencing two fits
+    against a common base. The two agree closely on quiet runs and diverge
+    where it matters, since differencing inherits the error of both estimates
+    and of whatever the base was doing.
+
+    Args:
+        rows: ``(n_frames, 6)`` as :func:`relative_motion` returns, or a path
+            to its ``.1D``.
+        radius: Sphere radius converting rotation to displacement.
+
+    Returns:
+        ``(n_frames,)`` mm. Element ``t`` is how far the head moved between
+        volume ``t - 1`` and volume ``t``; element 0 is zero by construction,
+        not by measurement.
+    """
+    rows = np.asarray(rows if not isinstance(rows, (str, Path))
+                      else np.loadtxt(rows), dtype=np.float64)
+    if rows.ndim != 2 or rows.shape[1] != 6:
+        raise ValueError(f"expected (n_frames, 6) parameters, got {rows.shape}")
+    return (np.abs(rows[:, 3:6]).sum(1)
+            + radius * np.abs(np.radians(rows[:, :3])).sum(1))
+
+
+def best_reference(displacement) -> int:
+    """The volume that moved least from both of its neighbours.
+
+    A registration target should be a volume the scanner caught while the head
+    was still. Motion *during* a volume's acquisition blurs it, and blur in the
+    target propagates into every frame fitted to it; a frame flanked by two
+    small displacements was almost certainly acquired in one position.
+
+    Scored as ``max(d[t], d[t + 1])`` -- the worse of the two neighbouring
+    displacements -- with their sum breaking ties. Minimising the *worse* one
+    is deliberate: a frame can sit at the end of a long still stretch and be
+    followed immediately by a lurch, which a sum would forgive and a max will
+    not.
+
+    The first and last volumes are never chosen. They have one neighbour each,
+    so their score is not comparable with the rest, and they are also where a
+    run is least trustworthy -- the start before the subject settles, the end
+    once they can feel it coming.
+
+    Args:
+        displacement: ``(n_frames,)`` from :func:`relative_displacement`.
+
+    Returns:
+        The chosen volume index.
+
+    Note:
+        This finds a volume that is *locally* still, which is not the same as
+        one in the run's *typical* head position. A subject who moves once and
+        then holds the new position gives that whole stretch near-zero
+        displacement, and a target picked from it is sharp but off-centre.
+        Where that matters, score the frames against the series instead --
+        :func:`lightprep.qc.motion.cdtm` asks how unlike the run each frame is,
+        which is the complementary question.
+    """
+    d = np.asarray(displacement, dtype=np.float64).ravel()
+    if d.size < 3:
+        return int(d.size // 2)
+    pair = np.column_stack([d[1:-1], d[2:]])
+    return 1 + int(np.lexsort((pair.sum(1), pair.max(1)))[0])
+
+
+def stable_reference(volume, out=None, radius: float = FD_RADIUS_MM):
+    """``(index, displacement)`` for the least-disturbed volume of a series.
+
+    The measurement pass this runs is cheap -- a few seconds for a couple of
+    hundred frames -- so there is little reason to guess a reference when the
+    data can be asked.
+    """
+    d = relative_displacement(relative_motion(volume, out), radius=radius)
+    return best_reference(d), d
+
+
+def brain_geometry(image, percentile: float = 40.0, mask=None):
+    """``(centroid, inertia tensor, count)`` of the brain, in world millimetres.
+
+    The pose arithmetic below needs to know what is being moved, not just how.
+    Every distance here is the distance *tissue* travels, so it is weighted by
+    where the tissue is: the second moment of the brain about its centroid.
+
+    A brain is not a sphere, and that matters. For a spherical object the
+    inertia tensor is a multiple of the identity and the pose average below
+    collapses to the textbook rotation average on SO(3); for a real brain,
+    longer front-to-back than top-to-bottom, a given rotation costs more
+    displacement about the short axis, and the average shifts accordingly.
+
+    Args:
+        image: Any volume on the series' grid -- only the geometry is used.
+        percentile: Used only when ``mask`` is None. Intensity percentile,
+            among non-zero voxels, above which a voxel counts as brain.
+
+            Be aware of what this fallback actually selects. Air in an EPI is
+            noisy rather than zero, so nearly every voxel passes ``> 0`` and the
+            threshold keeps a fixed *fraction of the field of view* -- measured
+            at 59% of the matrix on two subjects whose heads differ, giving an
+            RMS radius of 71mm against 50-54mm for a real brain. It is stable
+            but it is not anatomy, and it lengthens the lever arm every rotation
+            is weighted by.
+        mask: Boolean brain mask on ``image``'s grid, used in preference to
+            ``percentile``. Pass the real thing wherever one is available. It
+            should NOT be dilated: dilation is for intensity scores, where the
+            brain/air boundary carries the signal, whereas here the mask only
+            sets a second moment and padding it merely inflates the radius.
+
+    Returns:
+        ``(centroid (3,), second moment (3, 3), n voxels)``, all float64.
+    """
+    img = nib.load(str(image))
+    if mask is None:
+        data = np.asarray(img.dataobj, dtype=np.float64)
+        if data.ndim > 3:
+            data = data[..., 0]
+        positive = data[data > 0]
+        if positive.size == 0:
+            raise ValueError(f"no positive voxels in {image}, cannot locate a brain")
+        mask = data > np.percentile(positive, percentile)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.shape != img.shape[:3]:
+        raise ValueError(
+            f"mask is {mask.shape} but {image} is {img.shape[:3]}"
+        )
+    if not mask.any():
+        raise ValueError("mask selects no voxels")
+    index = np.array(np.nonzero(mask), dtype=np.float64).T
+    affine = np.asarray(img.affine, dtype=np.float64)
+    points = index @ affine[:3, :3].T + affine[:3, 3]
+    centroid = points.mean(0)
+    centred = points - centroid
+    return centroid, centred.T @ centred, len(points)
+
+
+def pose_distance(pull_a, pull_b, centroid, moment, count) -> float:
+    """RMS millimetres of tissue travel between two head poses.
+
+    Expanding the mean squared displacement over the brain leaves only traces,
+    so this costs nothing per pair once :func:`brain_geometry` has run::
+
+        D^2 = [2 tr(S) - 2 tr(R_a S R_b^T)] / N + || p_a - p_b ||^2
+
+    with ``S`` the inertia tensor and ``p`` the centroid's position under each
+    pose. It is the honest version of framewise displacement: no 50mm rotation
+    radius is assumed, the subject's own head supplies the lever arm.
+    """
+    a, b = np.asarray(pull_a, dtype=np.float64), np.asarray(pull_b, dtype=np.float64)
+    rot = np.trace(a[:3, :3] @ moment @ b[:3, :3].T)
+    gap = (a[:3, :3] @ centroid + a[:3, 3]) - (b[:3, :3] @ centroid + b[:3, 3])
+    squared = (2.0 * np.trace(moment) - 2.0 * rot) / count + gap @ gap
+    return float(np.sqrt(max(squared, 0.0)))
+
+
+def frechet_mean_pose(pulls, centroid, moment, weights=None) -> np.ndarray:
+    """The rigid pose minimising total squared tissue displacement, in closed form.
+
+    Minimising ``sum_t w_t sum_i || A_t x_i - M x_i ||^2`` over rigid ``M``
+    separates once the brain is centred, because the cross terms carry a
+    ``sum_i y_i`` that is zero by construction:
+
+    * the translation is the weighted mean of the centroid's positions;
+    * ``tr(R S R^T) = tr(S)`` is constant over rotations, so what is left is
+      ``max_R tr(R S (sum_t w_t R_t)^T)`` -- orthogonal Procrustes, one SVD.
+
+    No iteration, no tangent-space linearisation, no starting guess.
+
+    Args:
+        pulls: ``(T, 4, 4)`` world-space pulls, as :func:`parameters_to_pull`
+            returns them.
+        centroid: Brain centroid, from :func:`brain_geometry`.
+        moment: Brain inertia tensor, from :func:`brain_geometry`.
+        weights: Optional per-frame weights. Frames the fit should not be
+            allowed to drag the average toward get a small one.
+
+    Returns:
+        The 4x4 mean pose, in the same frame as ``pulls``.
+    """
+    pulls = np.asarray(pulls, dtype=np.float64)
+    rot = pulls[:, :3, :3]
+    position = rot @ centroid + pulls[:, :3, 3]
+
+    if weights is None:
+        weights = np.ones(len(pulls))
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.shape != (len(pulls),):
+        raise ValueError(f"expected {len(pulls)} weights, got {weights.shape}")
+    if not np.all(weights >= 0) or not weights.sum() > 0:
+        raise ValueError("weights must be non-negative and not all zero")
+    weights = weights / weights.sum()
+
+    u, _, vt = np.linalg.svd(moment @ np.einsum("t,tij->ij", weights, rot).T)
+    flip = np.diag([1.0, 1.0, np.sign(np.linalg.det(vt.T @ u.T))])
+    mean_rot = vt.T @ flip @ u.T
+
+    mean = np.eye(4)
+    mean[:3, :3] = mean_rot
+    mean[:3, 3] = weights @ position - mean_rot @ centroid
+    return mean
+
+
+def centre_pulls(pulls, mean_pose) -> np.ndarray:
+    """Re-express pulls so the series' mean pose is exactly the identity.
+
+    Right-composing with the mean's inverse moves the reference frame onto the
+    mean pose in one algebraic step -- there is nothing to converge. Writing
+    ``G = M*^-1``, the brain points in the new frame are ``z_i = M* x_i``, so
+
+        sum_t || (A_t G) z_i - M z_i ||^2 = sum_t || A_t x_i - (M M*) x_i ||^2
+
+    which is minimised at ``M = I``. This is what stops a groupwise template
+    inheriting the arbitrary pose of whichever volume seeded the first round.
+    """
+    inverse = np.linalg.inv(np.asarray(mean_pose, dtype=np.float64))
+    return np.asarray(pulls, dtype=np.float64) @ inverse
+
+
+def _estimate_pulls(echo: Path, ref_arg: str, work: Path, n_volumes: int,
+                    tag: str):
+    """``(pulls, corrected series)`` from one ``-moco`` pass.
+
+    The corrected series is niimath's own, resampled with its internal 8-tap
+    Lagrange kernel rather than this module's ``-final``. That is good enough
+    to score frames against each other -- which is all it is used for -- and it
+    saves resampling the run a second time just to look at it.
+    """
+    par = work / f"{tag}.1D"
+    corrected = work / f"{tag}_corrected.nii.gz"
+    precise = ["-bin"] if supports_bin() else []
+    niimath(echo, "-moco", "-ref", ref_arg, "-1Dfile", par, *precise, corrected)
+    img = nib.load(str(echo))
+    pulls = np.array([parameters_to_pull(row, img.affine, img.shape)
+                      for row in _read_parameters(par, n_volumes)])
+    return pulls, corrected
+
+
+def quiet_reference(displacement, history: int = SEED_HISTORY) -> int:
+    """Index of the volume with the quietest recent past and immediate future.
+
+    ``displacement`` is frame-to-frame motion, so entry ``t`` is the step from
+    ``t-1`` into ``t``. A volume is a good place to start from when the head
+    was already still for a while before it (the spin history has recovered),
+    was still during it, and had not begun moving by the next frame -- so the
+    window averaged here runs from ``t - history`` through ``t + 1``.
+
+    This asks for something different from :func:`best_reference`, which looks
+    only at the two immediate neighbours and takes the worst of them. That
+    finds a frame in a momentary lull; this one finds a frame in a quiet
+    stretch. The distinction matters on runs that move, where lulls are common
+    and quiet stretches are not.
+
+    Args:
+        displacement: Per-frame displacement, e.g. from
+            :func:`relative_displacement`. Entry 0 is a placeholder -- there is
+            no step into the first frame -- and is excluded from every window.
+        history: Frames of recent past the window covers.
+
+    Returns:
+        The chosen index, always one with a full window available.
+    """
+    d = np.asarray(displacement, dtype=np.float64).ravel()
+    width = history + 2
+    if d.size < width + 1:
+        return int(d.size // 2)
+    means = np.convolve(d, np.ones(width) / width, mode="valid")
+    # means[k] averages d[k : k+width], which is the window for t = k + history.
+    # k starts at 1 so the placeholder d[0] never enters a window.
+    return int(np.argmin(means[1:]) + 1 + history)
+
+
+def _flags_at(order, k: int, n: int):
+    """Each score's worst `k` frames, from a ranking sorted once."""
+    return {name: np.isin(np.arange(n), o[:k]) for name, o in order.items()}
+
+
+def select_frames(scores, max_drop: float = TEMPLATE_MAX_DROP):
+    """Keep the frames no score condemns, dropping as few as the scores allow.
+
+    Every score is "bigger is worse" and each condemns its own worst ``k``
+    frames. Raising ``k`` by one adds at most one frame per score, so the union
+    grows by at most ``len(scores)`` -- which is what makes
+    ``k = budget // len(scores)`` the largest count that is safe no matter how
+    little the scores agree. From there ``k`` rises while the *union* stays
+    within budget.
+
+    That the scores overlap is the point. Three views of a frame disagreeing
+    means the run is fine and ``k`` stops early; three views condemning the same
+    frames means ``k`` can go much further and still spend the budget on
+    genuinely bad frames rather than arbitrary ones. Measured here: pairwise
+    agreement runs 7-14% on clean runs against 58-74% on the worst one, which
+    lifts ``k`` from ~19% to ~32% of the run.
+
+    The union is nested in ``k``, so the largest feasible ``k`` is found by
+    bisection over the counts rather than by stepping one frame at a time, and
+    each score is ranked once rather than per step.
+
+    Args:
+        scores: Mapping of name -> per-frame score, all "bigger is worse" and
+            all the same length.
+        max_drop: Ceiling on the fraction of frames dropped.
+
+    Returns:
+        ``(keep, fraction, flags, agreement)``. ``agreement`` is the mean
+        pairwise Jaccard overlap of the flags, which is the useful diagnostic:
+        the rule always spends its whole budget, so *how much* it drops says
+        nothing, but *whether the scores agree about what to drop* separates a
+        run whose worst frames are merely its worst from one where three
+        independent views condemn the same frames. Measured here: 0.04-0.08 on
+        clean runs against 0.4-0.6 on a run that needs a human.
+
+    Note:
+        With mutually uninformative scores this lands on the ceiling
+        immediately, discarding ``max_drop`` of even a flawless run. That is
+        intended -- half a good run still makes a good target -- but it means
+        the drop count is not evidence of anything. Read ``agreement`` for that.
+    """
+    if not scores:
+        raise ValueError("need at least one score")
+    if not 0.0 < max_drop < 1.0:
+        raise ValueError(f"max_drop must be in (0, 1), got {max_drop}")
+    lengths = {len(v) for v in scores.values()}
+    if len(lengths) != 1:
+        raise ValueError(f"scores disagree in length: {lengths}")
+
+    n = lengths.pop()
+    budget = int(np.floor(max_drop * n))
+    order = {name: np.argsort(np.asarray(v, dtype=np.float64))[::-1]
+             for name, v in scores.items()}
+
+    def union_at(k):
+        u = np.zeros(n, dtype=bool)
+        for o in order.values():
+            u[o[:k]] = True
+        return u
+
+    # A score's k frames are distinct, so the union is never smaller than k:
+    # nothing above `budget` can fit, and `budget // len(scores)` always does.
+    lo, hi = budget // len(scores), budget
+    best = lo
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if union_at(mid).sum() <= budget:
+            best, lo = mid, mid + 1
+        else:
+            hi = mid - 1
+
+    flags = _flags_at(order, best, n)
+    pairs, names = [], sorted(flags)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            union = (flags[a] | flags[b]).sum()
+            pairs.append((flags[a] & flags[b]).sum() / union if union else 0.0)
+    agreement = float(np.mean(pairs)) if pairs else 1.0
+    return ~union_at(best), best / n, flags, agreement
+
+
+def _substack(img, data, parity, out: Path) -> Path:
+    """One slice parity as its own series, keeping the original world space."""
+    scale = np.eye(4)
+    scale[2, 2] = 2.0            # every second slice
+    scale[2, 3] = float(parity)  # ... starting at 0 or 1
+    nib.Nifti1Image(data[:, :, parity::2, :], np.asarray(img.affine) @ scale
+                    ).to_filename(out)
+    return out
+
+
+def within_tr_motion(echo, ref: int, centroid, moment, count, work) -> np.ndarray:
+    """Motion *inside* each TR, from the interleaved slice stacks.
+
+    An interleaved acquisition takes the odd slices in one half of the TR and
+    the even slices in the other, so a volume is two half-volumes about a second
+    apart. Motion-correcting each stack on its own gives two poses per TR, and
+    the distance between them is motion no rigid transform can undo: the volume
+    is internally smeared, not merely displaced.
+
+    Volume-level FD cannot see this -- measured across a clean cohort the two
+    correlate at rho ~ 0.08 -- because when the head moves mid-TR no single
+    rigid transform describes the volume, and the estimator returns an
+    unremarkable compromise.
+
+    Each stack is only ever registered against itself, never against the other:
+    the two sample planes 2mm apart, and comparing them as *images* is badly
+    conditioned along z -- tried, and it reported up to 2mm of motion on a
+    series with none. The comparison happens in parameter space instead, whose
+    noise floor measures at 0.008mm.
+
+    Args:
+        echo: The series to measure.
+        ref: Reference volume index, shared by both stacks.
+        centroid, moment, count: Brain geometry from :func:`brain_geometry`,
+            undilated. World-space, so one set serves both stacks unchanged.
+        work: Scratch directory.
+
+    Returns:
+        Per-volume millimetres, as RMS tissue displacement.
+
+    Note:
+        Both stacks are referenced to the same TR, so this returns
+        ``W_t - W_ref``: if the head moved inside the reference TR, every value
+        carries that offset. Choose ``ref`` from a quiet stretch.
+    """
+    echo = Path(echo)
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    img = nib.load(str(echo))
+    data = np.asarray(img.dataobj, dtype=np.float32)
+    precise = ["-bin"] if supports_bin() else []
+
+    pulls = {}
+    for parity, name in ((1, "odd"), (0, "even")):
+        src = _substack(img, data, parity, work / f"{name}.nii.gz")
+        par = work / f"{name}.1D"
+        niimath(src, "-moco", "-ref", str(ref), "-1Dfile", par, *precise,
+                work / f"{name}_mc.nii.gz")
+        sub = nib.load(str(src))
+        rows = _read_parameters(par, data.shape[3])
+        pulls[name] = [parameters_to_pull(r, sub.affine, sub.shape) for r in rows]
+
+    return np.array([pose_distance(o, e, centroid, moment, count)
+                     for o, e in zip(pulls["odd"], pulls["even"])])
+
+
+def step_motion(pulls, centroid, moment, count) -> np.ndarray:
+    """Motion between each volume and the one before it, in the same units."""
+    steps = np.zeros(len(pulls))
+    for t in range(1, len(pulls)):
+        steps[t] = pose_distance(pulls[t], pulls[t - 1], centroid, moment, count)
+    return steps
+
+
+def _cdtm_values(corrected, mask):
+    """Per-frame correlation distance to the run's iteratively refined mean.
+
+    CDTM asks whether a frame *looks like* the run, which catches what pose
+    arithmetic cannot see: a spike, a dropped slice, signal lost to a movement
+    that happened mid-acquisition. Its own outlier rule is a threshold or a
+    ratio; here a flat fraction is wanted instead, so the iterated distances
+    are used as a score and cut at the quantile.
+    """
+    from ..qc.motion import cdtm
+
+    return np.asarray(cdtm(corrected, mask=mask).values, dtype=np.float64)
+
+
+def template_reference(echo, out_dir, *, seed=None,
+                       max_drop: float = TEMPLATE_MAX_DROP,
+                       dilate: int = TEMPLATE_DILATE,
+                       max_rounds: int = TEMPLATE_MAX_ROUNDS,
+                       history: int = SEED_HISTORY, interp: str = "cubic",
+                       mask=None, work=None) -> Path:
+    """Build a groupwise registration target: the average of the best frames.
+
+    A single volume is one sample of the noise, and every estimate made against
+    it inherits that sample. Averaging the corrected series removes almost all
+    of it: measured split-half on corrected runs here, a single frame carries
+    2.7-11.2% noise against its own mean signal and a half-series average
+    carries 0.27-1.4%, a factor of 8-11 against a white-noise ceiling of about
+    10. Averaging is running at roughly 95% of the best it could do, so the
+    limiting noise in a single-frame target really is the kind that averages
+    away.
+
+    What that buys is reproducibility. Seeded from six different volumes, the
+    resulting frame-to-frame estimates scattered by 40 micrometres (p95 218) on
+    the worst run here when each seed was used as the target directly, and by
+    0.5 micrometres (p95 3.6) when each was first turned into an average. The
+    groupwise fixed point is, to that precision, unique -- the answer stops
+    depending on a choice nobody has a principled way to make.
+
+    It does not make the correction dramatically *better*: on a clean run the
+    output tSNR was unchanged against ``ref="middle"`` (15.40 vs 15.41) for
+    twice the runtime. Prefer it when the estimates themselves are the object
+    of study, or when a run's frames disagree enough that the choice of target
+    would otherwise be doing real work.
+
+    The loop:
+
+    0. ``-moco -relative`` over the raw series, and seed from the volume in the
+       quietest stretch (:func:`quiet_reference`). Nothing is registered yet,
+       so this choice is made on the data as acquired.
+    1. ``-moco -ref <target>``, keeping niimath's own corrected series.
+    2. Score every frame by CDTM against that series and keep the best
+       ``keep_fraction``.
+    3. Stop if that set is one already seen. Otherwise place the target on the
+       kept frames' mean pose (:func:`frechet_mean_pose`, :func:`centre_pulls`),
+       rebuild the average **from the original frames**, and go back to 1.
+
+    Two rules keep the iteration from eating what it gains:
+
+    * **Resample only from the original.** Each round rebuilds the average from
+      ``echo`` with a composed transform, never by resampling the previous
+      round's output, so the target carries exactly one interpolation however
+      many rounds run.
+    * **Put the target on the mean pose.** Otherwise the template keeps the
+      pose of whatever volume seeded round 0, and the series is corrected to an
+      arbitrary position rather than a central one.
+
+    Selection and averaging use the same kept set, so the target's pose and its
+    content agree about which frames are trusted.
+
+    Args:
+        echo: The series to build the target from -- the same echo motion will
+            be estimated on.
+        out_dir: Where ``reference.nii.gz``, ``template_frames.npy`` (the final
+            kept set) and ``template_cdtm.npy`` (the final distances) go.
+        seed: Volume to aim round 0 at. ``None`` measures the run and asks
+            :func:`quiet_reference`; an int forces one.
+        max_drop: Ceiling on the fraction of frames the selection may discard.
+            See :data:`TEMPLATE_MAX_DROP` and :func:`select_frames`.
+        dilate: Voxels of dilation on the mask used for the intensity score
+            only. See :data:`TEMPLATE_DILATE`.
+        max_rounds: Safety cap. See :data:`TEMPLATE_MAX_ROUNDS`.
+        history: Recent-history window for the seed. See :data:`SEED_HISTORY`.
+        interp: Interpolation used to build the average, one of
+            :data:`INTERPOLATIONS`. Defaults to the sharpest rather than to
+            ``moco``'s output kernel: blur in a target propagates into every
+            fit made against it, and this is paid for once.
+        mask: Brain mask for the CDTM scoring, on ``echo``'s grid. Omitted,
+            CDTM strips the first round's corrected series itself and the
+            result is reused for every later round. Pass one to skip that --
+            useful when a mask already exists, and when the strip is the least
+            reliable thing in the loop.
+        work: Scratch directory. A temporary one is used and removed if omitted.
+
+    Returns:
+        Path to the template, on ``echo``'s voxel grid -- which is what
+        ``-moco -ref`` requires of an image reference.
+
+    Warns:
+        UserWarning: If the kept set is still changing at ``max_rounds``, or if
+            it settles into a cycle rather than a fixed point. The template is
+            still returned; it is the last one built.
+
+    Note:
+        The average is over time, so task-driven and physiological signal
+        average out with the noise: the target ends up an essentially
+        anatomical EPI. That is a second reason to prefer it, independent of
+        SNR -- a single-frame target carries whatever the BOLD signal was doing
+        at that instant into every fit made against it.
+    """
+    if not supports_ref():
+        raise RuntimeError(
+            "a template reference needs niimath with '-moco -ref <n|img>'; "
+            "this build has no -ref, so there is no way to fit onto an image"
+        )
+    if not 0.0 < max_drop < 1.0:
+        raise ValueError(f"max_drop must be in (0, 1), got {max_drop}")
+    if max_rounds < 1:
+        raise ValueError(f"max_rounds must be at least 1, got {max_rounds}")
+
+    echo = Path(echo).resolve()
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    n_volumes = nib.load(str(echo)).shape[-1]
+
+    with contextlib.ExitStack() as stack:
+        if work is None:
+            work = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        work = Path(work)
+        work.mkdir(parents=True, exist_ok=True)
+
+        # 0. Seed from the raw series, before anything has been registered.
+        if seed is None:
+            relative = relative_displacement(
+                relative_motion(echo, work / "relative.1D"))
+            save_trace(relative, out_dir / "relative_fd.txt")
+            index = quiet_reference(relative, history=history)
+        else:
+            index = int(seed)
+        if not 0 <= index < n_volumes:
+            raise ValueError(
+                f"seed volume {index} is out of range for {n_volumes} volumes"
+            )
+
+        # The output grid never changes: every template lives on the input's
+        # voxel grid, and the pose lives in the transforms. Keeping it fixed is
+        # also what stops a round from overwriting the image it is resampling
+        # onto.
+        grid = work / "seed.nii.gz"
+        niimath(echo, "-crop", index, 1, grid)
+
+        frames = list(split_frames(echo, work / "frames", prefix="vol"))
+        target, template = str(index), out_dir / "reference.nii.gz"
+        seen, keep, values = [], None, None
+
+        for round_index in range(max_rounds):
+            pulls, corrected = _estimate_pulls(echo, target, work, n_volumes,
+                                               f"template{round_index}")
+            if mask is None:
+                from ..qc.motion import brain_mask
+                try:
+                    mask = brain_mask(corrected)
+                except (RuntimeError, DependencyError) as exc:
+                    # The workflow has to keep going without a person watching,
+                    # but the fallback is measurably worse -- an intensity cut
+                    # keeps a fixed fraction of the FOV rather than the brain,
+                    # giving a 71mm RMS radius against 50-54mm for a real mask,
+                    # which inflates every rotation. Say so loudly, and build it
+                    # here rather than leaving it None: None would send CDTM
+                    # back to the extraction that just failed.
+                    warnings.warn(
+                        f"brain extraction failed ({exc}); falling back to an "
+                        f"intensity threshold. Treat this run's motion scores "
+                        f"as approximate.", stacklevel=2)
+                    vol = np.asarray(nib.load(str(corrected)).dataobj[..., 0],
+                                     dtype=np.float64)
+                    mask = vol > np.percentile(vol[vol > 0], 40.0)
+                dilated = ndimage.binary_dilation(mask, iterations=dilate)
+
+            geom = brain_geometry(template if round_index else grid, mask=mask)
+            scores = {
+                "within_tr": within_tr_motion(echo, index, *geom,
+                                              work / f"wtr{round_index}"),
+                "between_tr": step_motion(pulls, *geom),
+                # Dilated here: the brain/air boundary is where motion shows.
+                "cdtm": np.asarray(_cdtm_values(corrected, dilated),
+                                   dtype=np.float64),
+            }
+            keep, fraction, flags, agreement = select_frames(
+                scores, max_drop=max_drop)
+            values = scores
+            if agreement > TEMPLATE_AGREEMENT:
+                warnings.warn(
+                    f"{Path(echo).name}: within-TR motion, between-TR motion and "
+                    f"CDTM agree on {100 * agreement:.0f}% of the frames they "
+                    f"reject (typical is under "
+                    f"{100 * TEMPLATE_AGREEMENT:.0f}%). The selection still "
+                    f"kept {100 * keep.mean():.0f}% because that is the "
+                    f"ceiling, so the template is being built partly from bad "
+                    f"frames -- this run wants a look.",
+                    stacklevel=2)
+
+            # The fixed point is the kept set repeating, which is the whole
+            # stopping rule. Comparing against every earlier set, not just the
+            # last, also catches a two-cycle instead of spinning until the cap.
+            packed = np.packbits(keep).tobytes()
+            if packed in seen:
+                if packed != (seen[-1] if seen else None):
+                    warnings.warn(
+                        f"template selection cycled rather than converging after "
+                        f"{round_index + 1} rounds; using the last average",
+                        stacklevel=2,
+                    )
+                break
+            seen.append(packed)
+
+            pulls = centre_pulls(pulls, frechet_mean_pose(pulls, *geom[:2],
+                                                          weights=keep.astype(float)))
+            _write_average(frames, pulls, keep, grid, template, work, interp)
+            target = str(template)
+        else:
+            warnings.warn(
+                f"template selection had not converged after {max_rounds} rounds; "
+                f"using the last average",
+                stacklevel=2,
+            )
+
+        np.save(out_dir / "template_frames.npy", keep)
+        for name, score in values.items():
+            np.save(out_dir / f"template_{name}.npy", np.asarray(score))
+
+    return template
+
+
+def _write_average(frames, pulls, keep, grid: Path, out: Path, work: Path,
+                   interp: str) -> Path:
+    """Resample the original frames onto ``grid`` and average the kept ones.
+
+    Each frame is scaled to a common brain mean first. A run drifts by a few
+    percent over its length, and without this the average is quietly weighted
+    toward whichever end was brighter.
+    """
+    grid_img = nib.load(str(grid))
+    reference = np.asarray(grid_img.dataobj, dtype=np.float64)
+    if reference.ndim > 3:
+        reference = reference[..., 0]
+    positive = reference[reference > 0]
+    mask = reference > np.percentile(positive, 40.0)
+
+    total = np.zeros(reference.shape, dtype=np.float64)
+    scales, used = [], 0
+    for t, (frame, pull) in enumerate(zip(frames, pulls)):
+        if not keep[t]:
+            continue
+        write_savemat(pull, work / f"tpl{t:04d}.json", fixed=grid, moving=frame)
+        dst = work / f"tpl{t:04d}.nii.gz"
+        niimath(frame, "-allineate", grid, "-applymat", work / f"tpl{t:04d}.json",
+                "-final", interp, dst)
+        data = np.asarray(nib.load(str(dst)).dataobj, dtype=np.float64)
+        if data.ndim > 3:
+            data = data[..., 0]
+        scale = data[mask].mean()
+        if not scale > 0:
+            continue
+        total += data / scale
+        scales.append(scale)
+        used += 1
+
+    if not used:
+        raise RuntimeError("every frame was excluded from the template average")
+    average = total / used * float(np.mean(scales))
+    nib.save(nib.Nifti1Image(average.astype(np.float32), grid_img.affine,
+                             grid_img.header), out)
+    return out
+
+
+def _reference_image(ref, n_volumes: int, echo: Path, out_dir: Path):
+    """``(reference image, the -ref argument for it)``.
+
+    niimath reads an all-digit argument as a volume number, so a file whose
+    name is digits must be given as ``./7``; paths are passed through
+    unchanged otherwise.
+    """
+    target = out_dir / "reference.nii.gz"
+    if isinstance(ref, (str, Path)) and str(ref) not in ("middle", "mean"):
+        ref_path = Path(ref).resolve()
+        if not ref_path.exists():
+            raise FileNotFoundError(f"reference image not found: {ref_path}")
+        arg = str(ref_path)
+        return ref_path, (f"./{arg}" if Path(arg).name.isdigit() else arg)
+
+    if ref == "mean":
+        niimath(echo, "-Tmean", target)
+        return target, str(target)
+
+    index = n_volumes // 2 if ref == "middle" else int(ref)
+    if not 0 <= index < n_volumes:
+        raise ValueError(
+            f"reference volume {index} is out of range for {n_volumes} volumes"
+        )
+    niimath(echo, "-crop", index, 1, target)
+    return target, str(index)
+
+
 def _reference_pull(ref, pulls, echo: Path, out_dir: Path, work: Path):
     """The reference image, and the pull that carries volume 0 onto it."""
     n_volumes = len(pulls)
@@ -152,6 +1066,7 @@ def moco(
     ref="middle",
     ref_echo: int = 0,
     interp: str = "linear",
+    template_mask=None,
     keep_workdir: bool = False,
 ) -> HMCResult:
     """Estimate head motion on one echo and apply it to every echo.
@@ -167,12 +1082,22 @@ def moco(
         echoes: Paths to the echo timeseries, ordered by echo time. A
             single-echo run is just a list of length one.
         out_dir: Directory for the realigned echoes and the motion estimates.
-        ref: Registration target. ``"middle"`` (default) uses the middle volume,
-            ``"mean"`` the mean volume, an int a specific volume index, or pass
-            a path to use an existing image. ``-moco`` itself always registers
-            onto volume 0; anything else is reached by composition afterwards,
-            which is exact, and for ``"mean"`` or a path costs one extra
-            registration.
+        ref: Registration target. ``"middle"`` (default) uses the middle
+            volume, ``"stable"`` the volume that moved least from both of its
+            neighbours (measured first by :func:`stable_reference`, a few
+            seconds), ``"template"`` a groupwise average of the corrected
+            series built by :func:`template_reference` (several times the cost,
+            and the only option whose result does not depend on picking a
+            volume), ``"mean"`` the mean volume -- which is *not* the same
+            thing, being an average of the series as acquired, motion and all
+            -- an int a specific volume index, or a path to an existing image. Where niimath
+            supports ``-ref`` the target is handed to the estimator; otherwise
+            it is reached by composition afterwards, which puts the output in
+            the same frame but leaves the fit itself against volume 0.
+            ``"stable"`` also writes ``relative_fd.txt`` beside the outputs:
+            the raw frame-to-frame displacement, which is a motion trace of the
+            *input* and so is not affected by anything this function then does
+            to it.
         ref_echo: Index into ``echoes`` to estimate motion on. Defaults to the
             first echo; pass ``1`` for the mid-TE echo that afni_proc.py favours.
         interp: Interpolation used when applying the transforms, one of
@@ -180,13 +1105,16 @@ def moco(
             uses internally (an 8-tap Lagrange): its own corrected output is
             discarded, so that every echo is resampled once, the same way, by
             the same call.
+        template_mask: Only for ``ref="template"``: a brain mask to score
+            frames in, passed through to :func:`template_reference`. Omitted,
+            it is derived from the data.
         keep_workdir: Keep the per-frame volumes, the ``.1D`` file and the
             reconstructed JSON transforms.
 
     Returns:
         An :class:`~lightprep.hmc.base.HMCResult`. ``transforms`` are FLIRT
         matrices, as the other methods' are, so this is a drop-in for them.
-        ``parameters`` is a six-column ``motion.par`` in MCFLIRT's convention --
+        ``parameters`` is a six-column ``motion.npy`` in MCFLIRT's convention --
         rotations (radians) then translations (mm) -- *not* the AFNI-ordered
         degrees that ``-moco`` itself writes, so the traces of all three methods
         can be compared directly.
@@ -229,23 +1157,51 @@ def moco(
     transform_dir.mkdir(exist_ok=True)
 
     # 1. Estimate, in one pass over the whole series.
-    par_1d = work / "moco.1D"
-    niimath(paths[ref_echo], "-moco", "-1Dfile", par_1d, work / "moco_corrected.nii.gz")
-    rows = np.atleast_2d(np.loadtxt(par_1d))
-    if rows.shape != (n_volumes, 6):
-        raise RuntimeError(
-            f"-moco wrote {rows.shape} motion parameters for {n_volumes} volumes"
-        )
-
+    #
+    # Where niimath supports it, the target is handed to the estimator so the
+    # fit is made against it. The older route -- estimate onto volume 0, then
+    # compose with the reference's own transform -- gives the same coordinate
+    # frame but a different registration: every frame was still fitted to
+    # volume 0, so a corrupted volume 0 degrades every estimate and no amount
+    # of re-referencing recovers it.
     img = nib.load(str(paths[ref_echo]))
+    par_1d = work / "moco.1D"
+    native_ref = supports_ref()
+
+    # 0. Ask the data which volume to aim at, before anything is registered.
+    if isinstance(ref, str) and ref == REF_STABLE:
+        ref, relative = stable_reference(paths[ref_echo], work / "relative.1D")
+        save_trace(relative, out_dir / "relative_fd.txt")
+    elif isinstance(ref, str) and ref == REF_TEMPLATE:
+        # Build the target out of the data first. This estimates the series a
+        # couple of extra times; the pass below then re-estimates against the
+        # finished template, so what is returned was fitted to it and not to
+        # some intermediate.
+        ref = template_reference(paths[ref_echo], out_dir, work=work / "template",
+                                 mask=template_mask)
+
+    # -bin, where it exists, is what keeps the estimate in float64: the -1Dfile
+    # text is AFNI's frozen %8.4f layout, so without it every transform below
+    # is rebuilt from parameters rounded to 1e-4 deg and 1e-4 mm.
+    precise = ["-bin"] if supports_bin() else []
+
+    if native_ref:
+        reference, ref_arg = _reference_image(ref, n_volumes, paths[ref_echo],
+                                              out_dir)
+        niimath(paths[ref_echo], "-moco", "-ref", ref_arg,
+                "-1Dfile", par_1d, *precise, work / "moco_corrected.nii.gz")
+    else:
+        niimath(paths[ref_echo], "-moco", "-1Dfile", par_1d, *precise,
+                work / "moco_corrected.nii.gz")
+
+    rows = _read_parameters(par_1d, n_volumes)
     pulls = [parameters_to_pull(row, img.affine, img.shape) for row in rows]
 
-    # 2. Re-reference. -moco works against volume 0; composing with the
-    #    reference's own transform moves the whole series onto whatever `ref`
-    #    asked for, exactly.
-    reference, ref_pull = _reference_pull(ref, pulls, paths[ref_echo], out_dir, work)
-    inv_ref = np.linalg.inv(ref_pull)
-    pulls = [pull @ inv_ref for pull in pulls]
+    if not native_ref:
+        # 2. Re-reference algebraically: same frame, different origin.
+        reference, ref_pull = _reference_pull(ref, pulls, paths[ref_echo],
+                                              out_dir, work)
+        pulls = [pull @ np.linalg.inv(ref_pull) for pull in pulls]
 
     transforms, parameters = [], []
     for t, pull in enumerate(pulls):
@@ -271,8 +1227,7 @@ def moco(
             corrected.append(out)
         merge_frames(corrected, dst, template=src)
 
-    par = out_dir / "motion.par"
-    np.savetxt(par, np.asarray(parameters), fmt="%.8g", delimiter="  ")
+    par = save_trace(parameters, out_dir / "motion.par")
 
     if not keep_workdir:
         shutil.rmtree(work, ignore_errors=True)
