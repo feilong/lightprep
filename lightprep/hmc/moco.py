@@ -836,7 +836,8 @@ def within_tr_motion(pulls, centroid, moment, count) -> np.ndarray:
                      for o, e in zip(odd, even)])
 
 
-def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S) -> np.ndarray:
+def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S,
+                   within=None) -> np.ndarray:
     """Recent motion preceding each frame, weighted by how long ago it was.
 
     A movement disturbs the spin history for a while afterwards: the slices are
@@ -851,27 +852,48 @@ def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S) -> np.ndarray
     same thing at any TR. Linear is a stand-in for the exponential recovery T1
     actually gives; at 3T (T1 ~ 1.4s) a 6s span reaches about four T1.
 
+    Movement *during* an earlier TR counts as much as movement between two of
+    them -- the magnetisation does not care which side of a volume boundary it
+    happened -- so ``within`` enters the window on the same footing, at the
+    weight for its own lag. Entry 0 of ``steps`` is a placeholder and never
+    enters; entry 0 of ``within`` is a real measurement and does.
+
+    This does double-count a little: a movement inside TR ``t-k`` shows up in
+    ``within[t-k]`` and again in the steps either side of it, so the result is
+    not literally the displacement over the window. It is a score to rank on,
+    and the two are near-independent in practice, so the overlap is small.
+
     Args:
         steps: Frame-to-frame motion; entry ``t`` is the step into ``t``, entry
             0 a placeholder that never enters a window.
         tr: Repetition time in seconds.
         span: How far back motion still counts.
+        within: Within-TR motion per frame, when the acquisition interleaves.
+            Omitted for a sequential one, which has none to measure.
 
     Returns:
-        ``(n_frames,)`` weighted RMS of the preceding steps; 0 where none are
+        ``(n_frames,)`` weighted RMS of the preceding motion; 0 where none is
         available.
     """
     d = np.asarray(steps, dtype=np.float64).ravel()
     n = d.size
+    w_in = None if within is None else np.asarray(within, dtype=np.float64).ravel()
+    if w_in is not None and w_in.size != n:
+        raise ValueError(f"within has {w_in.size} frames, steps has {n}")
     lags = np.arange(1, max(2, int(np.ceil(span / tr)) + 1))
     weights = np.maximum(0.0, 1.0 - lags * tr / span)
     out = np.zeros(n)
     for t in range(n):
         num = den = 0.0
-        for lag, w in zip(lags, weights):
-            if w > 0.0 and t - lag >= 1:
-                num += w * d[t - lag] ** 2
-                den += w
+        for lag, weight in zip(lags, weights):
+            if weight <= 0.0:
+                continue
+            if t - lag >= 1:                      # steps[0] is a placeholder
+                num += weight * d[t - lag] ** 2
+                den += weight
+            if w_in is not None and t - lag >= 0:  # within[0] is a measurement
+                num += weight * w_in[t - lag] ** 2
+                den += weight
         out[t] = np.sqrt(num / den) if den > 0.0 else 0.0
     return out
 
@@ -1186,7 +1208,7 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         rms_steps = relative_rms(steps, grid, mask=mask)
         within = None if stacks is None else within_tr_motion(stacks, *geom)
         motion = {"current": current_motion(rms_steps, within),
-                  "history": motion_history(rms_steps, tr, span)}
+                  "history": motion_history(rms_steps, tr, span, within=within)}
 
         frames = list(split_frames(echo, work / "frames", prefix="vol"))
         target, boldref = str(index), out_dir / "reference.nii.gz"
