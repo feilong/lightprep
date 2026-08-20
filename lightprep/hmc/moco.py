@@ -915,25 +915,25 @@ def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S,
 def current_motion(steps, within=None) -> np.ndarray:
     """Motion at the time of each frame: the steps either side, and within it.
 
-    All three describe movement while this frame was being acquired or
-    immediately around it, so they carry equal weight and combine in
-    quadrature. ``within`` is absent for a sequential acquisition, where the
-    slice stacks are acquired together and there is no within-TR motion to
-    measure; the score is then simply the two steps.
-    """
-    d = np.asarray(steps, dtype=np.float64).ravel()
-    n = d.size
-    w = None if within is None else np.asarray(within, dtype=np.float64).ravel()
-    out = np.zeros(n)
-    for t in range(n):
-        parts = [] if w is None else [w[t]]
-        if t >= 1:
-            parts.append(d[t])
-        if t + 1 < n:
-            parts.append(d[t + 1])
-        out[t] = np.sqrt(np.mean(np.square(parts))) if parts else 0.0
-    return out
+    Two levels, not three peers. The steps into and out of a frame are two
+    measurements of one thing -- how much the head moved between this volume
+    and its neighbours -- so they are combined first, by
+    :func:`neighbour_motion`. Only then does the within-TR term join, at equal
+    weight, because it is one measurement of a different thing. Pooling all
+    three at once would give between-TR twice the influence merely because
+    there happen to be two of it:
 
+        between[t] = sqrt( (d[t]^2 + d[t+1]^2) / 2 )
+        current[t] = sqrt( (W[t]^2 + between[t]^2) / 2 )
+
+    ``within`` is absent for a sequential acquisition, where the slice stacks
+    are acquired together and there is no within-TR motion to measure; the
+    score is then the between-TR term alone.
+    """
+    between = neighbour_motion(steps)
+    if within is None:
+        return between
+    return combine_rms(np.asarray(within, dtype=np.float64).ravel(), between)
 
 def step_motion(pulls, centroid, moment, count) -> np.ndarray:
     """Motion between each volume and the one before it, in the same units."""
