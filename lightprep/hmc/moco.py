@@ -1614,7 +1614,7 @@ def moco(
                     "-applymat", work / f"xfm{t:04d}.json",
                     "-final", interp, out)
             corrected.append(out)
-        merge_frames(corrected, dst, boldref=src)
+        merge_frames(corrected, dst, template=src)
 
     par = save_trace(parameters, out_dir / "motion.par")
 

@@ -858,6 +858,7 @@ def _as_traces(fd) -> dict:
 def motion_report(volumes, out_html, *, fd=None, title: str = "motion QC",
                   subtitle: str = "", dvars_traces=None, distance=None,
                   outliers=None, distance_max: float | None = 0.05,
+                  panels=None,
                   surfaces=None, mesh_thickness_mm: float = 1.0,
                   contours=None, niivue_js=None,
                   source: str = "embed", stage: bool = True,
@@ -889,6 +890,13 @@ def motion_report(volumes, out_html, *, fd=None, title: str = "motion QC",
             still in anatomical coordinates will draw, confidently, in the
             wrong place. Labels containing "pial" and "white" pick the
             conventional colours, anything else cycles.
+        panels: Extra traces to draw, ``{title: series}`` or
+            ``{title: {label: series}}`` for several on one panel. A value may
+            also be ``(series, threshold, ymax)`` to set the dashed line and fix
+            the axis. Drawn after FD, DVARS and the distance panel, each with a
+            checkbox: a page carrying five measures is unreadable all at once
+            and useless with any of them missing, so which are shown is the
+            reader's choice rather than the writer's.
         contours: ``{label: path}`` of binary volumes drawn as coloured
             overlays on every viewer, on the volumes' own grid. This is the way
             to get a real surface contour: NiiVue has no mesh-plane
@@ -1016,6 +1024,17 @@ def motion_report(volumes, out_html, *, fd=None, title: str = "motion QC",
         overlays.append({"label": label, "name": path.name, "colormap": cmap,
                          "url": _stage(path, out_html, label)})
 
+    extra = []
+    for title, value in dict(panels or {}).items():
+        threshold, ymax = None, None
+        if isinstance(value, tuple):
+            value, threshold, ymax = (list(value) + [None, None])[:3]
+        series = value if hasattr(value, "items") else {str(title): value}
+        extra.append([str(title),
+                      {k: list(np.asarray(v, dtype=np.float64).ravel()[1:])
+                       for k, v in dict(series).items()},
+                      threshold, ymax])
+
     html = _HTML.replace("/*NIIVUE*/", Path(bundle).read_text(encoding="utf-8"))
     html = html.replace("/*DATA*/", json.dumps({
         "volumes": payload,
@@ -1025,7 +1044,7 @@ def motion_report(volumes, out_html, *, fd=None, title: str = "motion QC",
         "traces": traces,
         "panels": [["FD (mm)", traces, fd_threshold, None],
                    ["DVARS (standardised)", dtraces, 1.5, None],
-                   ["CD to mean image", ctraces, 0.01, distance_max]],
+                   ["CD to mean image", ctraces, 0.01, distance_max]] + extra,
         "nFrames": n_frames,
         "title": title,
         "subtitle": subtitle,
@@ -1078,15 +1097,23 @@ svg.trace{width:100%;height:76px;display:block;background:var(--panel);
 .pick span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .err{padding:9px 11px;color:var(--warn);font-size:12px;line-height:1.45}
 .legend{display:inline-flex;align-items:center;gap:5px;margin-right:12px}
+#toggles{padding:4px 18px 0;display:flex;flex-wrap:wrap;gap:4px 16px;
+  font-size:12px;color:var(--dim)}
+.toggle{display:inline-flex;align-items:center;gap:5px;cursor:pointer;
+  user-select:none}
+.toggle input{cursor:pointer;margin:0}
+.toggle.empty{opacity:.45;cursor:default}
+.toggle.empty input{cursor:default}
 .swatch{width:11px;height:3px;border-radius:2px;display:inline-block}
 </style></head><body>
 <header><h1 id="title"></h1><div class="sub" id="subtitle"></div></header>
 <div id="viewers"></div>
 <div id="bar"><span id="frame"></span><span id="stats"></span></div>
+<div id="toggles"></div>
 <div id="plot"></div>
-<div class="hint" id="hint">Drag on a trace to move through frames; drag on a
-  volume to move the crosshair, which both viewers follow. Arrow keys step
-  frames; Home/End jump to the ends.</div>
+<div class="hint" id="hint">Tick a measure to draw it. Drag on a trace to move
+  through frames; drag on a volume to move the crosshair, which both viewers
+  follow. Arrow keys step frames; Home/End jump to the ends.</div>
 <script>/*NIIVUE*/</script>
 <script>
 const D = /*DATA*/;
@@ -1187,6 +1214,7 @@ async function build(){
     const others = viewers.filter(o => o !== nv);
     if (others.length && nv.broadcastTo) nv.broadcastTo(others, {"2d":true});
   });
+  drawToggles();
   drawPlot();
   setFrame(0);
 }
@@ -1244,14 +1272,40 @@ async function loadMeshes(nv){
 const PAD = {l:44, r:12, t:12, b:24};
 let plotW = 900, plotH = 88, nPts = 1;
 
+// Which panels are drawn. A page carrying five measures is unreadable with all
+// of them and useless with the wrong ones missing, so the reader chooses --
+// and a panel with no data anywhere starts off, since an empty axis is just
+// noise competing for height.
+const shown = D.panels.map(([, tr]) =>
+  Object.values(tr).some(a => a && a.length));
+
+function drawToggles(){
+  const host = document.getElementById("toggles");
+  if (!host) return;
+  host.innerHTML = "";
+  D.panels.forEach(([name, tr], i) => {
+    const has = Object.values(tr).some(a => a && a.length);
+    const id = "panel" + i;
+    const label = document.createElement("label");
+    label.className = "toggle" + (has ? "" : " empty");
+    const box = document.createElement("input");
+    box.type = "checkbox"; box.id = id; box.checked = shown[i]; box.disabled = !has;
+    box.onchange = () => { shown[i] = box.checked; drawPlot(); setFrame(frame); };
+    label.appendChild(box);
+    label.appendChild(document.createTextNode(has ? name : name + " (no data)"));
+    host.appendChild(label);
+  });
+}
+
 function drawPlot(){
   const host = document.getElementById("plot");
   host.innerHTML = "";
   let bar = "";
-  for (const [name, traces, thr, ymax] of D.panels){
+  D.panels.forEach(([name, traces, thr, ymax], i) => {
+    if (!shown[i]) return;
     panel(host, traces, name, thr, ymax);
     bar += summarise(traces, name, thr);
-  }
+  });
   document.getElementById("stats").innerHTML = bar;
 }
 
@@ -1351,7 +1405,8 @@ function setFrame(f){
     const v = tr[k][frame-1];
     return v === undefined ? `${k} --` : `${k} ${fmt(v)}`;
   }).join(" ");
-  const parts = D.panels.map(([name, tr]) => {
+  const parts = D.panels.map(([name, tr], i) => {
+    if (!shown[i]) return "";
     const t = at(tr);
     return t ? `${name.split(" ")[0]} ${t}` : "";
   }).filter(Boolean).join("   ");
