@@ -58,7 +58,7 @@ from .moco import (REF_STABLE, REF_GROUPWISE, best_reference, brain_geometry,
                    stable_reference, supports_bin, supports_ref,
                    supports_relative, select_frames, step_motion,
                    neighbour_motion, current_motion, motion_history,
-                   within_tr_pulls, combine_rms,
+                   within_tr_pulls, combine_rms, interleaved_slices,
                    groupwise_reference, within_tr_motion)
 from .niimath import allineate
 
@@ -99,4 +99,4 @@ __all__ = ["HMCResult", "moco", "allineate", "mcflirt", "METHODS",
            "brain_geometry", "pose_distance", "quiet_reference",
            "select_frames", "within_tr_motion", "step_motion",
            "neighbour_motion", "current_motion", "motion_history",
-           "within_tr_pulls", "combine_rms"]
+           "within_tr_pulls", "combine_rms", "interleaved_slices"]

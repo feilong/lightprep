@@ -737,6 +737,37 @@ def _substack(img, data, parity, out: Path) -> Path:
     return out
 
 
+
+def interleaved_slices(slice_timing, tr: float) -> bool:
+    """Whether odd and even slices are acquired in different halves of the TR.
+
+    This is the property :func:`within_tr_motion` lives on, so it is what to
+    test -- not whether the order "looks interleaved". Multiband acquires
+    several slices at once and Siemens orders them by parity within each band,
+    so pattern-matching the acquisition order is fiddly, while the question that
+    matters is simply whether splitting on parity separates the two halves in
+    time.
+
+    A sequential acquisition puts consecutive slices one slice-interval apart,
+    so the parity means differ by about ``tr / n_slices`` -- negligible. An
+    interleaved one separates them by roughly half a TR, which is what makes
+    the odd and even stacks two views of the head a half-TR apart.
+
+    Args:
+        slice_timing: Seconds from the volume's start, one per slice. BIDS
+            ``SliceTiming``.
+        tr: Repetition time in seconds.
+
+    Returns:
+        True when the parity means are more than a quarter of a TR apart.
+    """
+    times = np.asarray(slice_timing, dtype=np.float64).ravel()
+    if times.size < 4 or not tr > 0:
+        return False
+    separation = abs(times[1::2].mean() - times[0::2].mean())
+    return bool(separation > 0.25 * tr)
+
+
 def within_tr_pulls(echo, ref: int, work):
     """Motion *inside* each TR, from the interleaved slice stacks.
 
@@ -1360,6 +1391,8 @@ def moco(
     ref="middle",
     ref_echo: int = 0,
     interp: str = "linear",
+    tr: float | None = None,
+    interleaved: bool | None = None,
     groupwise_mask=None,
     keep_workdir: bool = False,
 ) -> HMCResult:
@@ -1399,6 +1432,14 @@ def moco(
             uses internally (an 8-tap Lagrange): its own corrected output is
             discarded, so that every echo is resampled once, the same way, by
             the same call.
+        tr: Repetition time in seconds, for the spin-history window of
+            ``ref="groupwise"``. Read from the header when omitted, which is
+            worth overriding from the sidecar -- a NIfTI pixdim[4] is not
+            always the TR.
+        interleaved: Whether slices are acquired in two interleaved halves, so
+            within-TR motion is measurable. Pass
+            :func:`interleaved_slices(SliceTiming, tr)` rather than assuming;
+            omitted, ``groupwise_reference`` assumes True.
         groupwise_mask: Only for ``ref="groupwise"``: a brain mask to score
             frames in, passed through to :func:`groupwise_reference`. Omitted,
             it is derived from the data.
@@ -1471,8 +1512,9 @@ def moco(
         # couple of extra times; the pass below then re-estimates against the
         # finished boldref, so what is returned was fitted to it and not to
         # some intermediate.
+        extra = {} if interleaved is None else {"interleaved": interleaved}
         ref = groupwise_reference(paths[ref_echo], out_dir, work=work / "groupwise",
-                                 mask=groupwise_mask)
+                                  mask=groupwise_mask, tr=tr, **extra)
 
     # -bin, where it exists, is what keeps the estimate in float64: the -1Dfile
     # text is AFNI's frozen %8.4f layout, so without it every transform below
