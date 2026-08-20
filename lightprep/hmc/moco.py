@@ -234,11 +234,15 @@ SELECT_MAX_DROP = 0.5
 #: means the badness is real and more widespread than the ceiling can remove.
 #:
 #: Not a reason to drop a run automatically; a reason for someone to look at it.
-#: The statistic moves with how many scores there are, so it has to be
-#: recalibrated whenever they change: on the current three it reads 0.10 for a
-#: clean run against 0.42 for the worst one here. Two runs is thin evidence for
-#: where between those the line belongs -- treat it as provisional until swept
-#: across a cohort.
+#: The statistic moves with how many scores there are and what they measure, so
+#: it needs recalibrating whenever those change: on the current three it reads
+#: 0.16 for a clean run against 0.42 for the worst one here, and two runs is
+#: thin evidence for where between those the line belongs.
+#:
+#: Nothing but this warning depends on it. The per-frame scores are written
+#: beside each reference, so the agreement of a finished run can be recomputed
+#: in seconds and the threshold revised without reprocessing anything --
+#: calibrate it from a cohort after the fact rather than guessing before.
 GROUPWISE_AGREEMENT = 0.25
 
 #: Voxels of dilation on the mask used for the intensity score. The brain/air
@@ -656,12 +660,11 @@ def select_frames(scores, max_drop: float = SELECT_MAX_DROP):
     little the scores agree. From there ``k`` rises while the *union* stays
     within budget.
 
-    That the scores overlap is the point. Three views of a frame disagreeing
-    means the run is fine and ``k`` stops early; three views condemning the same
-    frames means ``k`` can go much further and still spend the budget on
-    genuinely bad frames rather than arbitrary ones. Measured here: pairwise
-    agreement runs 7-14% on clean runs against 58-74% on the worst one, which
-    lifts ``k`` from ~19% to ~32% of the run.
+    That the scores overlap is the point. Views of a frame disagreeing means
+    the run is fine and ``k`` stops early; views condemning the same frames mean
+    ``k`` can go much further and still spend the budget on genuinely bad frames
+    rather than arbitrary ones. On the current three scores that lifts ``k``
+    from 0.22 to 0.30 of the run between a clean subject and the worst one.
 
     The union is nested in ``k``, so the largest feasible ``k`` is found by
     bisection over the counts rather than by stepping one frame at a time, and
