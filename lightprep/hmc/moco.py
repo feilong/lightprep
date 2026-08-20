@@ -1050,7 +1050,7 @@ def groupwise_reference(echo, out_dir, *, seed=None,
                        tr: float | None = None,
                        span: float = SPIN_HISTORY_S,
                        interleaved: bool = True,
-                       interp: str = "cubic",
+                       interp: str = "linear",
                        mask=None, work=None) -> Path:
     """Build a groupwise registration target: the average of the best frames.
 
@@ -1124,9 +1124,17 @@ def groupwise_reference(echo, out_dir, *, seed=None,
             the motion criterion then reduces to the between-TR term. Read it
             from SliceTiming rather than assuming.
         interp: Interpolation used to build the average, one of
-            :data:`INTERPOLATIONS`. Defaults to the sharpest rather than to
-            ``moco``'s output kernel: blur in a target propagates into every
-            fit made against it, and this is paid for once.
+            :data:`INTERPOLATIONS`. ``linear`` is niimath's name for the
+            trilinear kernel every other resample in this package uses, and
+            matching them is worth more than the sharper reference a cubic
+            average would give.
+
+            A reference on a different kernel from the data is a reference that
+            differs from it in smoothness as well as in content, and that
+            confounds anything measured between the two -- a coregistration
+            cost read across the pair reflects the kernels as much as the
+            registration. Cubic does make a visibly sharper average, so this is
+            a real cost, knowingly paid for comparability.
         mask: Brain mask for the CDTM scoring, on ``echo``'s grid. Omitted,
             CDTM strips the first round's corrected series itself and the
             result is reused for every later round. Pass one to skip that --
