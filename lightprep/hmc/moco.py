@@ -204,6 +204,13 @@ REF_STABLE = "stable"
 #: :func:`groupwise_reference`.
 REF_GROUPWISE = "groupwise"
 
+#: Seconds over which a movement still counts against a later frame's spin
+#: history. Defined in time rather than frames so it means the same at any TR.
+#: Linear decay to zero here stands in for the exponential recovery T1 gives;
+#: at 3T (T1 ~ 1.4s) six seconds is about four T1, by which point the
+#: magnetisation has largely forgotten.
+SPIN_HISTORY_S = 6.0
+
 #: Frames of recent history a seed volume is asked to have been quiet through.
 #: A movement disturbs more than the frame it happens in: the spins carry the
 #: perturbed history for several TR before the steady state recovers, so a
@@ -227,11 +234,11 @@ SELECT_MAX_DROP = 0.5
 #: means the badness is real and more widespread than the ceiling can remove.
 #:
 #: Not a reason to drop a run automatically; a reason for someone to look at it.
-#: Measured on two scores: 0.17 on a clean run against 0.70 on the worst one
-#: here. (On three scores the same runs gave 0.04-0.08 against 0.53 -- the
-#: statistic moves with the number of scores, so it is not transferable.) Two
-#: runs is thin evidence for where between 0.17 and 0.70 the line belongs;
-#: treat it as provisional until swept across a cohort.
+#: The statistic moves with how many scores there are, so it has to be
+#: recalibrated whenever they change: on the current three it reads 0.10 for a
+#: clean run against 0.42 for the worst one here. Two runs is thin evidence for
+#: where between those the line belongs -- treat it as provisional until swept
+#: across a cohort.
 GROUPWISE_AGREEMENT = 0.25
 
 #: Voxels of dilation on the mask used for the intensity score. The brain/air
@@ -730,7 +737,7 @@ def _substack(img, data, parity, out: Path) -> Path:
     return out
 
 
-def within_tr_motion(echo, ref: int, centroid, moment, count, work) -> np.ndarray:
+def within_tr_pulls(echo, ref: int, work):
     """Motion *inside* each TR, from the interleaved slice stacks.
 
     An interleaved acquisition takes the odd slices in one half of the TR and
@@ -750,15 +757,18 @@ def within_tr_motion(echo, ref: int, centroid, moment, count, work) -> np.ndarra
     series with none. The comparison happens in parameter space instead, whose
     noise floor measures at 0.008mm.
 
+    Returns the two pose traces rather than the distance between them, so a
+    caller that later improves its mask can rescore without repeating the two
+    ``-moco`` passes -- the registrations do not depend on the mask, only the
+    conversion to millimetres does.
+
     Args:
         echo: The series to measure.
         ref: Reference volume index, shared by both stacks.
-        centroid, moment, count: Brain geometry from :func:`brain_geometry`,
-            undilated. World-space, so one set serves both stacks unchanged.
         work: Scratch directory.
 
     Returns:
-        Per-volume millimetres, as RMS tissue displacement.
+        ``(odd, even)``, each a list of world-space pulls, one per volume.
 
     Note:
         Both stacks are referenced to the same TR, so this returns
@@ -782,8 +792,77 @@ def within_tr_motion(echo, ref: int, centroid, moment, count, work) -> np.ndarra
         rows = _read_parameters(par, data.shape[3])
         pulls[name] = [parameters_to_pull(r, sub.affine, sub.shape) for r in rows]
 
+    return pulls["odd"], pulls["even"]
+
+
+def within_tr_motion(pulls, centroid, moment, count) -> np.ndarray:
+    """Millimetres between the two half-TR poses, from :func:`within_tr_pulls`."""
+    odd, even = pulls
     return np.array([pose_distance(o, e, centroid, moment, count)
-                     for o, e in zip(pulls["odd"], pulls["even"])])
+                     for o, e in zip(odd, even)])
+
+
+def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S) -> np.ndarray:
+    """Recent motion preceding each frame, weighted by how long ago it was.
+
+    A movement disturbs the spin history for a while afterwards: the slices are
+    excited having last been excited in a different position, and the
+    magnetisation takes of order T1 to forget it. So a frame can be perfectly
+    still itself and still be wrong, and that is a different defect from being
+    smeared -- measured here, the two correlate at only 0.06-0.44, which is why
+    they are separate criteria rather than one averaged score.
+
+    The weight falls linearly from 1 at the immediately preceding step to 0 at
+    ``span`` seconds, and the window is defined in *seconds* so it means the
+    same thing at any TR. Linear is a stand-in for the exponential recovery T1
+    actually gives; at 3T (T1 ~ 1.4s) a 6s span reaches about four T1.
+
+    Args:
+        steps: Frame-to-frame motion; entry ``t`` is the step into ``t``, entry
+            0 a placeholder that never enters a window.
+        tr: Repetition time in seconds.
+        span: How far back motion still counts.
+
+    Returns:
+        ``(n_frames,)`` weighted RMS of the preceding steps; 0 where none are
+        available.
+    """
+    d = np.asarray(steps, dtype=np.float64).ravel()
+    n = d.size
+    lags = np.arange(1, max(2, int(np.ceil(span / tr)) + 1))
+    weights = np.maximum(0.0, 1.0 - lags * tr / span)
+    out = np.zeros(n)
+    for t in range(n):
+        num = den = 0.0
+        for lag, w in zip(lags, weights):
+            if w > 0.0 and t - lag >= 1:
+                num += w * d[t - lag] ** 2
+                den += w
+        out[t] = np.sqrt(num / den) if den > 0.0 else 0.0
+    return out
+
+
+def current_motion(steps, within=None) -> np.ndarray:
+    """Motion at the time of each frame: the steps either side, and within it.
+
+    All three describe movement while this frame was being acquired or
+    immediately around it, so they carry equal weight and combine in
+    quadrature. ``within`` is absent for a sequential acquisition, where the
+    slice stacks are acquired together and there is no within-TR motion to
+    measure; the score is then simply the two steps.
+    """
+    d = np.asarray(steps, dtype=np.float64).ravel()
+    n = d.size
+    w = None if within is None else np.asarray(within, dtype=np.float64).ravel()
+    out = np.zeros(n)
+    for t in range(n):
+        parts = [] if w is None else [w[t]]
+        if t >= 1:
+            parts.append(d[t])
+        if t + 1 < n:
+            parts.append(d[t + 1])
+        out[t] = np.sqrt(np.mean(np.square(parts))) if parts else 0.0
+    return out
 
 
 def step_motion(pulls, centroid, moment, count) -> np.ndarray:
@@ -894,7 +973,9 @@ def groupwise_reference(echo, out_dir, *, seed=None,
                        max_drop: float = SELECT_MAX_DROP,
                        dilate: int = GROUPWISE_DILATE,
                        max_rounds: int = GROUPWISE_MAX_ROUNDS,
-                       history: int = SEED_HISTORY, interleaved: bool = True,
+                       tr: float | None = None,
+                       span: float = SPIN_HISTORY_S,
+                       interleaved: bool = True,
                        interp: str = "cubic",
                        mask=None, work=None) -> Path:
     """Build a groupwise registration target: the average of the best frames.
@@ -958,7 +1039,10 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         dilate: Voxels of dilation on the mask used for the intensity score
             only. See :data:`GROUPWISE_DILATE`.
         max_rounds: Safety cap. See :data:`GROUPWISE_MAX_ROUNDS`.
-        history: Recent-history window for the seed. See :data:`SEED_HISTORY`.
+        tr: Repetition time in seconds, for the spin-history window. Read from
+            the header when omitted.
+        span: Seconds over which past motion still counts. See
+            :data:`SPIN_HISTORY_S`.
         interleaved: Whether slices are acquired interleaved, so that the odd
             and even stacks sample different halves of the TR and within-TR
             motion is measurable. False for a sequential acquisition, where the
@@ -1005,7 +1089,14 @@ def groupwise_reference(echo, out_dir, *, seed=None,
     echo = Path(echo).resolve()
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    n_volumes = nib.load(str(echo)).shape[-1]
+    img = nib.load(str(echo))
+    n_volumes = img.shape[-1]
+    if tr is None:
+        tr = float(img.header.get_zooms()[3]) if img.ndim > 3 else 0.0
+    if not tr > 0:
+        raise ValueError(
+            "a repetition time is needed to weight the spin-history window in "
+            f"seconds; pass tr= (the header gives {tr!r}, which is not usable)")
 
     with contextlib.ExitStack() as stack:
         if work is None:
@@ -1013,62 +1104,55 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         work = Path(work)
         work.mkdir(parents=True, exist_ok=True)
 
-        # 0a. A first reference on Power FD alone. It is the one score that
-        # needs no mask, which is the whole reason it goes first: everything
-        # better is measured in RMS tissue displacement, and that needs to know
-        # what the brain is.
+        # 0a. A first reference on Power FD alone -- the one score needing no
+        # mask, which is the whole reason it goes first. Same two terms the
+        # frames are later judged on, just in FD units: motion at the time of
+        # the frame, and motion still echoing from before it.
         steps = relative_motion(echo, work / "relative.1D")
-        save_trace(relative_displacement(steps), out_dir / "relative_fd.txt")
-        first = (quiet_reference(relative_displacement(steps), history=history)
-                 if seed is None else int(seed))
+        fd = relative_displacement(steps)
+        save_trace(fd, out_dir / "relative_fd.txt")
+        if seed is None:
+            first = int(np.argmin(combine_rms(current_motion(fd),
+                                              motion_history(fd, tr, span))))
+        else:
+            first = int(seed)
         if not 0 <= first < n_volumes:
             raise ValueError(
                 f"seed volume {first} is out of range for {n_volumes} volumes")
         first_vol = work / "first.nii.gz"
         niimath(echo, "-crop", first, 1, first_vol)
 
-        # 0b. Strip that one volume for the mask. A single EPI frame is noisier
+        # 0b. Strip that one volume for a mask. A single EPI frame is noisier
         # than the multi-frame mean brain_mask would normally take, but the mask
-        # is only ever consumed as a second moment, and the noise averages out
-        # of that: measured against the 20-frame mask, Dice 0.96-0.995 and RMS
-        # radius within 0.4mm. On a run that moves it is the better of the two,
-        # a temporal mean there being a smeared union of head positions.
+        # is only consumed as a second moment and the noise averages out of
+        # that: Dice 0.96-0.995 against the multi-frame mask, RMS radius within
+        # 0.4mm. On a run that moves it is the better of the two, a temporal
+        # mean there being a smeared union of head positions.
         mask = _strip_or_threshold(first_vol)
         first_geom = brain_geometry(first_vol, mask=mask)
 
-        # 0c. Now the honest scores, and a second reference chosen on both:
-        # quiet through a stretch (spin history takes several TR to recover)
-        # AND quiet within itself. within-TR is measured against `first`, so it
-        # carries that frame's own within-TR motion -- small if `first` is
-        # quiet, which is what picking it on FD was for.
-        between = relative_rms(steps, first_vol, mask=mask)
-        within = (within_tr_motion(echo, first, *first_geom, work / "within_tr")
-                  if interleaved else None)
-        stretch = window_rms(between, history)
-        index = int(np.argmin(stretch if within is None
-                              else combine_rms(stretch, within))) \
-            if seed is None else first
+        # 0c. The same two terms again, now in the units everything downstream
+        # uses. The odd/even registrations are done once here and rescored
+        # later against the final mask -- they do not depend on it.
+        stacks = within_tr_pulls(echo, first, work / "within_tr") if interleaved else None
+        rms_steps = relative_rms(steps, first_vol, mask=mask)
+        within = None if stacks is None else within_tr_motion(stacks, *first_geom)
+        index = first if seed is not None else int(np.argmin(combine_rms(
+            current_motion(rms_steps, within), motion_history(rms_steps, tr, span))))
 
-        # 0d. The reference everything is registered to, and its own mask. The
+        # 0d. The reference everything is registered to, and its own mask: the
         # brain sits differently in this frame than in `first`, so the geometry
-        # is re-derived here rather than carried over.
+        # is re-derived rather than carried over. Both motion scores are
+        # rescored against it, which costs arithmetic and no registration.
         grid = work / "seed.nii.gz"
         niimath(echo, "-crop", index, 1, grid)
         mask = _strip_or_threshold(grid)
         dilated = ndimage.binary_dilation(mask, iterations=dilate)
         geom = brain_geometry(grid, mask=mask)
-        # One motion criterion, not two. Within-TR and between-TR are the same
-        # quantity over different intervals -- RMS tissue displacement -- so
-        # they belong in quadrature rather than as rival votes, and a run that
-        # moves both ways should not be condemned twice for it.
-        #
-        # It also makes a sequential acquisition a special case of nothing.
-        # There is no odd/even split to exploit, so the motion score is simply
-        # the between-TR term and the rest of the loop does not notice.
-        between_local = neighbour_motion(relative_rms(steps, grid, mask=mask))
-        detail = {"within_tr": within, "between_tr": between_local}
-        motion = {"motion": (between_local if within is None
-                             else combine_rms(within, between_local))}
+        rms_steps = relative_rms(steps, grid, mask=mask)
+        within = None if stacks is None else within_tr_motion(stacks, *geom)
+        motion = {"current": current_motion(rms_steps, within),
+                  "history": motion_history(rms_steps, tr, span)}
 
         frames = list(split_frames(echo, work / "frames", prefix="vol"))
         target, boldref = str(index), out_dir / "reference.nii.gz"
@@ -1108,7 +1192,7 @@ def groupwise_reference(echo, out_dir, *, seed=None,
 
             if agreement > GROUPWISE_AGREEMENT:
                 warnings.warn(
-                    f"{Path(echo).name}: the motion and CDTM scores agree on "
+                    f"{Path(echo).name}: the selection scores agree on "
                     f"{100 * agreement:.0f}% of the frames they "
                     f"reject (typical is under "
                     f"{100 * GROUPWISE_AGREEMENT:.0f}%). The selection still "
@@ -1148,13 +1232,14 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         # the rule to re-read.
         np.save(out_dir / "boldref_frames.npy", keep)
         np.save(out_dir / "boldref_cdtm.npy", np.asarray(values))
-        np.save(out_dir / "boldref_motion.npy", np.asarray(motion["motion"]))
-        # The two terms behind the motion score, so a reader can see which of
-        # them condemned a frame. Absent for a sequential acquisition, where
-        # there is no within-TR term to separate out.
-        for name, score in detail.items():
-            if score is not None:
-                np.save(out_dir / f"boldref_{name}.npy", np.asarray(score))
+        for name, score in motion.items():
+            np.save(out_dir / f"boldref_{name}.npy", np.asarray(score))
+        # The within-TR term behind `current`, so a reader can see whether a
+        # frame was condemned for being smeared or merely for moving. Absent
+        # for a sequential acquisition, which has no within-TR term.
+        if within is not None:
+            np.save(out_dir / "boldref_within_tr.npy", np.asarray(within))
+        np.save(out_dir / "boldref_between_tr.npy", np.asarray(rms_steps))
 
     return boldref
 
