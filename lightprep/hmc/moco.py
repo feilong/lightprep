@@ -837,7 +837,7 @@ def within_tr_motion(pulls, centroid, moment, count) -> np.ndarray:
 
 
 def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S,
-                   within=None, min_support: float = 0.0) -> np.ndarray:
+                   within=None, min_lags: int = 0) -> np.ndarray:
     """Recent motion preceding each frame, weighted by how long ago it was.
 
     A movement disturbs the spin history for a while afterwards: the slices are
@@ -893,21 +893,25 @@ def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S,
         raise ValueError(f"within has {w_in.size} frames, steps has {n}")
     lags = np.arange(1, max(2, int(np.ceil(span / tr)) + 1))
     weights = np.maximum(0.0, 1.0 - lags * tr / span)
-    full = weights.sum() * (1 if w_in is None else 2)
     out = np.zeros(n)
     for t in range(n):
         num = den = 0.0
+        complete = 0
         for lag, weight in zip(lags, weights):
             if weight <= 0.0:
                 continue
-            if t - lag >= 1:                      # steps[0] is a placeholder
+            # steps[0] is a placeholder -- there is no step into the first
+            # frame -- while within[0] is a real measurement, so the step is
+            # the binding constraint and a lag with one has both.
+            if t - lag >= 1:
                 num += weight * d[t - lag] ** 2
                 den += weight
-            if w_in is not None and t - lag >= 0:  # within[0] is a measurement
-                num += weight * w_in[t - lag] ** 2
-                den += weight
+                complete += 1
+                if w_in is not None:
+                    num += weight * w_in[t - lag] ** 2
+                    den += weight
         out[t] = np.sqrt(num / den) if den > 0.0 else 0.0
-        if den < min_support * full:
+        if complete < min_lags:
             out[t] = np.inf
     return out
 
@@ -1184,7 +1188,7 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         if seed is None:
             first = int(np.argmin(combine_rms(
                 current_motion(fd),
-                motion_history(fd, tr, span, min_support=1.0))))
+                motion_history(fd, tr, span, min_lags=1))))
         else:
             first = int(seed)
         if not 0 <= first < n_volumes:
@@ -1210,7 +1214,7 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         within = None if stacks is None else within_tr_motion(stacks, *first_geom)
         index = first if seed is not None else int(np.argmin(combine_rms(
             current_motion(rms_steps, within),
-            motion_history(rms_steps, tr, span, within=within, min_support=1.0))))
+            motion_history(rms_steps, tr, span, within=within, min_lags=1))))
 
         # 0d. The reference everything is registered to, and its own mask: the
         # brain sits differently in this frame than in `first`, so the geometry
