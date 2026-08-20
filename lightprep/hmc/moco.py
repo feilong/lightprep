@@ -837,7 +837,7 @@ def within_tr_motion(pulls, centroid, moment, count) -> np.ndarray:
 
 
 def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S,
-                   within=None) -> np.ndarray:
+                   within=None, min_support: float = 0.0) -> np.ndarray:
     """Recent motion preceding each frame, weighted by how long ago it was.
 
     A movement disturbs the spin history for a while afterwards: the slices are
@@ -870,10 +870,21 @@ def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S,
         span: How far back motion still counts.
         within: Within-TR motion per frame, when the acquisition interleaves.
             Omitted for a sequential one, which has none to measure.
+        min_support: Fraction of the window's total weight that must be
+            available, below which the frame scores infinite instead of
+            whatever little evidence there is.
+
+            The default of 0 scores an unmeasurable history as 0, which is
+            right when this is a criterion for *rejecting* frames: the opening
+            frames of a run have no history, and that is not a reason to throw
+            them out. It is wrong when the score is minimised to *choose* a
+            reference, because 0 is the best attainable value and the opening
+            frames would win on the absence of evidence -- measured, that
+            elected frame 0 or 1 in 14 of 59 runs here, and frame 0 is the one
+            most likely to be disturbed. Pass 1.0 to require a full window.
 
     Returns:
-        ``(n_frames,)`` weighted RMS of the preceding motion; 0 where none is
-        available.
+        ``(n_frames,)`` weighted RMS of the preceding motion.
     """
     d = np.asarray(steps, dtype=np.float64).ravel()
     n = d.size
@@ -882,6 +893,7 @@ def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S,
         raise ValueError(f"within has {w_in.size} frames, steps has {n}")
     lags = np.arange(1, max(2, int(np.ceil(span / tr)) + 1))
     weights = np.maximum(0.0, 1.0 - lags * tr / span)
+    full = weights.sum() * (1 if w_in is None else 2)
     out = np.zeros(n)
     for t in range(n):
         num = den = 0.0
@@ -895,6 +907,8 @@ def motion_history(steps, tr: float, span: float = SPIN_HISTORY_S,
                 num += weight * w_in[t - lag] ** 2
                 den += weight
         out[t] = np.sqrt(num / den) if den > 0.0 else 0.0
+        if den < min_support * full:
+            out[t] = np.inf
     return out
 
 
@@ -1168,8 +1182,9 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         fd = relative_displacement(steps)
         save_trace(fd, out_dir / "relative_fd.txt")
         if seed is None:
-            first = int(np.argmin(combine_rms(current_motion(fd),
-                                              motion_history(fd, tr, span))))
+            first = int(np.argmin(combine_rms(
+                current_motion(fd),
+                motion_history(fd, tr, span, min_support=1.0))))
         else:
             first = int(seed)
         if not 0 <= first < n_volumes:
@@ -1194,7 +1209,8 @@ def groupwise_reference(echo, out_dir, *, seed=None,
         rms_steps = relative_rms(steps, first_vol, mask=mask)
         within = None if stacks is None else within_tr_motion(stacks, *first_geom)
         index = first if seed is not None else int(np.argmin(combine_rms(
-            current_motion(rms_steps, within), motion_history(rms_steps, tr, span))))
+            current_motion(rms_steps, within),
+            motion_history(rms_steps, tr, span, within=within, min_support=1.0))))
 
         # 0d. The reference everything is registered to, and its own mask: the
         # brain sits differently in this frame than in `first`, so the geometry
