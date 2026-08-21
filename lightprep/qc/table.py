@@ -231,7 +231,8 @@ def outlier_fractions(series, thresholds):
 
 def outlier_summary(runs, thresholds, out_html, *, acquisition=None,
                     sessions=None, duration=None, gap_warn: float = 300.0,
-                    links=None, placeholders=(), **kwargs) -> Path:
+                    links=None, placeholders=(), annotate=None,
+                    **kwargs) -> Path:
     """A coloured grid of how often each measure objects, one row per run.
 
     Args:
@@ -251,8 +252,10 @@ def outlier_summary(runs, thresholds, out_html, *, acquisition=None,
             appear here; a gap is only ever measured between two runs of the
             same session.
         duration: ``{label: seconds}``. With it a gap is the real dead time
-            between one run ending and the next starting; without it, the
-            interval between starts, which is the same thing plus a run.
+            between one row ending and the next starting; without it the
+            interval runs start to start, which is the same thing plus a scan,
+            and is written with a leading ``\u2264`` to say so. Give durations for
+            the placeholder rows too -- a field map is short but not zero.
         gap_warn: Seconds after which a gap is called out. A long one is where
             the subject was spoken to, repositioned, or left alone -- and
             wherever a field map sits far from what it corrects.
@@ -260,6 +263,10 @@ def outlier_summary(runs, thresholds, out_html, *, acquisition=None,
         placeholders: Labels to show as rows with no measures -- field maps and
             anatomicals, which have no frames to score but do have a place in
             the order, and whose neighbours are what a reader wants to see.
+        annotate: ``{label: text}`` appended to that row's interval. An
+            interval is only ever measured to the previous row *given here*,
+            so where scans exist that this table does not list, they sit
+            silently inside it; this is how to say so.
         **kwargs: Passed to :func:`summary_table`.
 
     Returns:
@@ -286,15 +293,23 @@ def outlier_summary(runs, thresholds, out_html, *, acquisition=None,
 
         ordered = sorted(table, key=key)
         table = {k: table[k] for k in ordered}
-        last = {}                               # per session: (end time, label)
-        for label in ordered:
+        extra = {str(k): str(v) for k, v in dict(annotate or {}).items()}
+        last = {}                    # per session: (end of the previous row,
+        for label in ordered:        #  whether that end was actually known)
             now, group = times.get(label), groups.get(label, "")
             if now is not None and group in last:
-                gap = now - last[group]
-                notes[label] = _duration(gap)
-                marks[label] = gap > gap_warn
+                end, known = last[group]
+                gap = now - end
+                notes[label] = ("" if known else "\u2264") + _duration(gap)
+                # An upper bound over the threshold is not evidence of a long
+                # gap -- most of it may be the previous scan. Mark only what
+                # the times actually establish.
+                marks[label] = known and gap > gap_warn
+            if label in extra:
+                notes[label] = (notes.get(label, "") + " " + extra[label]).strip()
             if now is not None:
-                last[group] = now + float((duration or {}).get(label, 0.0))
+                length = (duration or {}).get(label)
+                last[group] = (now + float(length or 0.0), length is not None)
     return summary_table(table, out_html, links=links, notes=notes, marks=marks,
                          **kwargs)
 
