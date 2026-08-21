@@ -42,8 +42,10 @@ def summary_table(table, out_html, *, title: str = "QC summary",
         notes: ``{row: text}`` shown dim beside the label, for something that
             is not a percentage and must not share the colour scale.
         marks: ``{row: bool}`` drawing attention to a row's note.
-        severe: Percentage at which colour saturates.
-        quiet: Percentage below which nothing is painted.
+        severe: Value at which colour saturates. A dict keyed by column sets
+            it per column, for a grid whose columns are not all percentages --
+            a millimetre and a percent should not share a ramp.
+        quiet: Value below which nothing is painted; also per-column by dict.
         note: Free text under the table, for what the thresholds were.
 
     Returns:
@@ -53,6 +55,12 @@ def summary_table(table, out_html, *, title: str = "QC summary",
     if not table:
         raise ValueError("nothing to tabulate")
     columns = list(next(iter(table.values())))
+
+    def scale(value, default):
+        if isinstance(value, dict):
+            return [float(value.get(c, default)) for c in columns]
+        return [float(value)] * len(columns)
+
     rows = [{"run": r, "url": (links or {}).get(r, ""),
              "note": (notes or {}).get(r, ""), "mark": bool((marks or {}).get(r)),
              "values": [v.get(c) for c in columns]} for r, v in table.items()]
@@ -61,9 +69,9 @@ def summary_table(table, out_html, *, title: str = "QC summary",
     out_html.parent.mkdir(parents=True, exist_ok=True)
     out_html.write_text(
         _HTML.replace("/*DATA*/", json.dumps(
-            {"columns": columns, "rows": rows, "severe": float(severe),
-             "quiet": float(quiet), "title": title, "subtitle": subtitle,
-             "note": note})),
+            {"columns": columns, "rows": rows,
+             "severe": scale(severe, SEVERE), "quiet": scale(quiet, QUIET),
+             "title": title, "subtitle": subtitle, "note": note})),
         encoding="utf-8")
     return out_html
 
@@ -112,9 +120,9 @@ document.getElementById("note").textContent = D.note;
 // Colour has to earn its place: a healthy run flags a fraction of a percent, so
 // a linear ramp would paint every real problem the same near-nothing. Square
 // root reaches half intensity by a quarter of the severe mark.
-function paint(v){
-  if (v == null || v < D.quiet) return "";
-  const t = Math.min(1, Math.sqrt(v / D.severe));
+function paint(v, i){
+  if (v == null || v < D.quiet[i]) return "";
+  const t = Math.min(1, Math.sqrt(v / D.severe[i]));
   // amber -> red, lightening the text as the ground darkens under it
   const r = Math.round(120 + 100*t), g = Math.round(90 - 60*t), b = 40;
   return `background:rgba(${r},${g},${b},${0.25 + 0.65*t})`;
@@ -131,7 +139,9 @@ function draw(){
     return desc ? y - x : x - y;
   });   // no sort column: leave the order given, which is acquisition order
         // when times were supplied and alphabetical when they were not
-  let h = "<thead><tr><th class='run'>run</th>";
+  const back = sortCol < 0 ? "" : " <span class=\"arrow\">\u21ba</span>";
+  let h = `<thead><tr><th class="run" data-i="-1" title="back to the`
+        + ` original order">run${back}</th>`;
   D.columns.forEach((c, i) => {
     h += `<th data-i="${i}">${c}` +
          (sortCol === i ? ` <span class="arrow">${desc ? "↓" : "↑"}</span>` : "") +
@@ -148,8 +158,8 @@ function draw(){
       ? ` <span class="gap${r.mark ? " long" : ""}">${r.note}</span>` : "";
     h += `<tr class="${empty ? "placeholder" : ""}">` +
          `<td class="run">${label}${note}</td>`;
-    r.values.forEach(v => {
-      const s = paint(v);
+    r.values.forEach((v, i) => {
+      const s = paint(v, i);
       h += `<td class="${s ? "paint" : ""}" style="${s}">` +
            (v == null ? "" : (v === 0 ? "·" : v.toFixed(v < 10 ? 1 : 0))) +
            "</td>";
@@ -160,7 +170,13 @@ function draw(){
   document.querySelectorAll("th[data-i]").forEach(th => {
     th.onclick = () => {
       const i = +th.dataset.i;
-      if (i === sortCol) desc = !desc; else { sortCol = i; desc = true; }
+      // Largest first, then smallest, then back to the order the table was
+      // written in -- which is the one carrying the acquisition sequence, and
+      // was unreachable once any column had been clicked.
+      if (i < 0) sortCol = -1;
+      else if (i !== sortCol) { sortCol = i; desc = true; }
+      else if (desc) desc = false;
+      else sortCol = -1;
       draw();
     };
   });
@@ -231,7 +247,7 @@ def outlier_fractions(series, thresholds):
 
 def outlier_summary(runs, thresholds, out_html, *, acquisition=None,
                     sessions=None, duration=None, gap_warn: float = 300.0,
-                    links=None, placeholders=(), annotate=None,
+                    links=None, placeholders=(), annotate=None, columns=None,
                     **kwargs) -> Path:
     """A coloured grid of how often each measure objects, one row per run.
 
@@ -263,6 +279,11 @@ def outlier_summary(runs, thresholds, out_html, *, acquisition=None,
         placeholders: Labels to show as rows with no measures -- field maps and
             anatomicals, which have no frames to score but do have a place in
             the order, and whose neighbours are what a reader wants to see.
+        columns: ``{label: {name: value}}`` of things that are not outlier
+            percentages -- a pose difference in millimetres, a temperature --
+            added after the measure columns. Pass ``severe`` and ``quiet`` as
+            dicts to give them their own colour scale, since a millimetre and
+            a percent do not belong on one ramp.
         annotate: ``{label: text}`` appended to that row's interval. An
             interval is only ever measured to the previous row *given here*,
             so where scans exist that this table does not list, they sit
@@ -278,6 +299,11 @@ def outlier_summary(runs, thresholds, out_html, *, acquisition=None,
 
     table = {label: outlier_fractions(series, thresholds)
              for label, series in runs.items()}
+    columns = {str(k): dict(v) for k, v in dict(columns or {}).items()}
+    if columns:
+        names = list(dict.fromkeys(n for v in columns.values() for n in v))
+        for label, row in table.items():
+            row.update({n: columns.get(label, {}).get(n) for n in names})
 
     times = {k: _seconds(v) for k, v in dict(acquisition or {}).items()}
     notes, marks = {}, {}
