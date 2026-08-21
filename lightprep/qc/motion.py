@@ -1312,8 +1312,17 @@ function drawPlot(){
   let bar = "";
   D.panels.forEach(([name, traces, thr, ymax], i) => {
     if (!shown[i]) return;
-    panel(host, traces, name, thr, ymax);
-    bar += summarise(traces, name, thr);
+    // One panel that cannot draw must not silently delete the ones after it.
+    try {
+      panel(host, traces, name, thr, ymax);
+      bar += summarise(traces, name, thr);
+    } catch (err) {
+      console.error("panel failed:", name, err);
+      const d = document.createElement("div");
+      d.className = "err";
+      d.textContent = name + ": could not be drawn (" + err.message + ")";
+      host.appendChild(d);
+    }
   });
   document.getElementById("stats").innerHTML = bar;
 }
@@ -1329,6 +1338,13 @@ function summarise(traces, name, thr){
       <b>${over.toFixed(0)}%</b>&gt;${thr}</span>`;
   }).join("");
 }
+
+// Shared: panel() labels a clipped peak with it and setFrame() the readout.
+// It lived inside setFrame, so panel()'s use of it threw ReferenceError --
+// and only on runs bad enough to clip, which is the worst way to fail: the
+// exception aborted drawPlot mid-loop, so a high-motion run silently lost
+// every panel after the first one to overflow its axis.
+const fmt = v => Math.abs(v) < 0.1 ? v.toFixed(4) : v.toFixed(2);
 
 function panel(host, traces, name, thr, ymax){
   const labels = Object.keys(traces);
@@ -1438,7 +1454,6 @@ function setFrame(f){
   // both are differences, so frame f pairs with trace[f-1]
   // Adaptive precision: CD runs around 0.01, so two decimals would print
   // every frame of a run as the same number.
-  const fmt = v => Math.abs(v) < 0.1 ? v.toFixed(4) : v.toFixed(2);
   const at = (tr) => Object.keys(tr).map(k => {
     const v = tr[k][frame-1];
     return v === undefined ? `${k} --` : `${k} ${fmt(v)}`;
