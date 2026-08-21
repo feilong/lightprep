@@ -911,9 +911,12 @@ def motion_report(volumes, out_html, *, fd=None, title: str = "motion QC",
             rather than a contour. About a voxel gives a thin outline; large
             enough that triangles crossing the plane are not missed, small
             enough that it reads as a line.
-        outliers: Frame indices to mark, typically ``cdtm(...).outliers``.
-            Shaded across every panel, because whether a flagged frame also
-            stands out in FD or DVARS is the thing worth seeing.
+        outliers: Frame indices to call out in the frame readout, typically
+            the union of whatever the caller counts as bad. It no longer draws
+            the bars: each panel shades where its own trace crosses its own
+            threshold, so a bar means *this* measure objected. A frame in
+            ``outliers`` is still labelled OUTLIER as you scrub past it, which
+            is what says a frame is bad by some measure not currently shown.
         dvars_traces: The same shapes, drawn in a second panel below FD.
             Separate rather than overlaid because DVARS is in standardised
             intensity units and FD in millimetres; one axis would make the
@@ -1336,11 +1339,19 @@ function panel(host, traces, name, thr, ymax){
   let s = `<svg viewBox="0 0 ${plotW} ${plotH}" preserveAspectRatio="none"
            class="trace">`;
   s += `<text x="${PAD.l}" y="11" fill="#8b949e" font-size="11">${name}</text>`;
-  (D.outliers || []).forEach(f => {
-    const xf = x(f-1);
-    s += `<line x1="${xf}" y1="${PAD.t}" x2="${xf}" y2="${plotH-PAD.b}"
-          stroke="#f85149" stroke-width="1.2" opacity=".45"/>`;
-  });
+  // Marked where THIS measure exceeds ITS OWN threshold. Shading one panel
+  // with another's verdict says a frame is bad here when it is bad elsewhere,
+  // which is the opposite of what a per-measure panel is for -- the whole
+  // reason to draw five of them is to see which one objects.
+  if (thr != null) {
+    const bad = new Set();
+    labels.forEach(k => traces[k].forEach((v, i) => { if (v > thr) bad.add(i); }));
+    bad.forEach(i => {
+      const xf = x(i);
+      s += `<line x1="${xf}" y1="${PAD.t}" x2="${xf}" y2="${plotH-PAD.b}"
+            stroke="#f85149" stroke-width="1.2" opacity=".45"/>`;
+    });
+  }
   s += `<line x1="${PAD.l}" y1="${y(0)}" x2="${plotW-PAD.r}" y2="${y(0)}"
         stroke="#2a313c"/>`;
   s += `<line x1="${PAD.l}" y1="${y(thr)}" x2="${plotW-PAD.r}"
