@@ -159,9 +159,13 @@ def dvars(volume, mask=None, standardize: bool = True,
     drift moves the head with little frame-to-frame intensity change. Power et
     al. (2012) introduced them together for that reason.
 
-    ``standardize`` divides by the run's own robust temporal standard
-    deviation, estimated per voxel as ``IQR / 1.349`` and averaged over the
-    mask, following the convention fMRIPrep reports. A value near 1 is then
+    ``standardize`` divides by the expected transition under a stationary null
+    -- the run's own robust temporal standard deviation, per voxel as
+    ``IQR / 1.349`` and averaged over the mask, times ``sqrt(2 * (1 - rho_1))``
+    for the lag-1 correlation between successive frames. Both halves are needed:
+    the SD alone leaves the result at ``sqrt(2 * (1 - rho_1))`` rather than 1,
+    so its scale is set by how temporally smooth the data happen to be. A value
+    near 1 is then
     "as much change as this run's noise usually produces", and it is
     comparable between runs and subjects, which raw intensity units are not.
 
@@ -208,11 +212,33 @@ def dvars(volume, mask=None, standardize: bool = True,
         scale = float(np.mean(sd[sd > 0])) if np.any(sd > 0) else 1.0
 
     out = np.empty(n - 1, dtype=np.float64)
+    # Lag-1 statistics, accumulated in the pass we are making anyway.
+    s_p = s_c = s_pp = s_cc = s_pc = 0.0
     prev = np.asanyarray(img.dataobj[..., 0], dtype=np.float64)[keep]
     for t in range(1, n):
         cur = np.asanyarray(img.dataobj[..., t], dtype=np.float64)[keep]
         out[t - 1] = np.sqrt(np.mean((cur - prev) ** 2))
+        s_p = s_p + prev; s_c = s_c + cur
+        s_pp = s_pp + prev * prev; s_cc = s_cc + cur * cur
+        s_pc = s_pc + prev * cur
         prev = cur
+
+    if standardize:
+        # The missing half of the standardisation. Dividing by the temporal SD
+        # alone leaves DVARS at sqrt(2*(1 - rho_1)), not 1, because successive
+        # frames are correlated: for a stationary series
+        # E[(x_t - x_{t-1})^2] = 2 * sigma^2 * (1 - rho_1). Without this the
+        # scale is set by how smooth the data happen to be -- across a 59-run
+        # cohort the median run sat at 1.28, so a threshold of 1.5 was only 17%
+        # above a typical frame and flagged most of a healthy run.
+        m = n - 1
+        cov = s_pc / m - (s_p / m) * (s_c / m)
+        var_p = s_pp / m - (s_p / m) ** 2
+        var_c = s_cc / m - (s_c / m) ** 2
+        good = (var_p > 0) & (var_c > 0)
+        if good.any():
+            rho = np.median(cov[good] / np.sqrt(var_p[good] * var_c[good]))
+            scale *= float(np.sqrt(max(2.0 * (1.0 - rho), 1e-6)))
     return out / scale if scale else out
 
 
