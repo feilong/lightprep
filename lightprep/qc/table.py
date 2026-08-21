@@ -26,8 +26,9 @@ QUIET = 0.5
 
 
 def summary_table(table, out_html, *, title: str = "QC summary",
-                  subtitle: str = "", links=None, severe: float = SEVERE,
-                  quiet: float = QUIET, note: str = "") -> Path:
+                  subtitle: str = "", links=None, notes=None, marks=None,
+                  severe: float = SEVERE, quiet: float = QUIET,
+                  note: str = "") -> Path:
     """Write a coloured grid of per-run, per-measure outlier percentages.
 
     Args:
@@ -38,6 +39,9 @@ def summary_table(table, out_html, *, title: str = "QC summary",
         title, subtitle: Page heading and the line under it.
         links: ``{row: url}`` making a row label clickable -- normally its own
             report, so the grid is a way in rather than a dead end.
+        notes: ``{row: text}`` shown dim beside the label, for something that
+            is not a percentage and must not share the colour scale.
+        marks: ``{row: bool}`` drawing attention to a row's note.
         severe: Percentage at which colour saturates.
         quiet: Percentage below which nothing is painted.
         note: Free text under the table, for what the thresholds were.
@@ -50,6 +54,7 @@ def summary_table(table, out_html, *, title: str = "QC summary",
         raise ValueError("nothing to tabulate")
     columns = list(next(iter(table.values())))
     rows = [{"run": r, "url": (links or {}).get(r, ""),
+             "note": (notes or {}).get(r, ""), "mark": bool((marks or {}).get(r)),
              "values": [v.get(c) for c in columns]} for r, v in table.items()]
 
     out_html = Path(out_html)
@@ -90,6 +95,10 @@ tr:hover td.paint{background-image:linear-gradient(rgba(255,255,255,.06),
   rgba(255,255,255,.06))}
 .note{padding:8px 18px 20px;color:var(--dim);font-size:12px;max-width:70em}
 .arrow{color:#58a6ff}
+.gap{color:#6e7681;font-size:11px;margin-left:7px}
+.gap.long{color:#f0883e}
+tr.placeholder td{color:#6e7681;font-style:italic}
+tr.placeholder td.run a{color:#6e7681}
 </style></head><body>
 <header><h1 id="title"></h1><div class="sub" id="subtitle"></div></header>
 <div class="wrap"><table id="grid"></table></div>
@@ -120,7 +129,8 @@ function draw(){
     if (x == null) return 1;
     if (y == null) return -1;
     return desc ? y - x : x - y;
-  }); else rows.sort((a, b) => a.run.localeCompare(b.run));
+  });   // no sort column: leave the order given, which is acquisition order
+        // when times were supplied and alphabetical when they were not
   let h = "<thead><tr><th class='run'>run</th>";
   D.columns.forEach((c, i) => {
     h += `<th data-i="${i}">${c}` +
@@ -129,8 +139,15 @@ function draw(){
   });
   h += "</tr></thead><tbody>";
   for (const r of rows){
+    // A row with nothing measured is a placeholder -- a field map or an
+    // anatomical, which has no frames to score but does have a place in the
+    // order, and whose neighbours are the point of showing it.
+    const empty = r.values.every(v => v == null);
     const label = r.url ? `<a href="${r.url}">${r.run}</a>` : r.run;
-    h += `<tr><td class="run">${label}</td>`;
+    const note = r.note
+      ? ` <span class="gap${r.mark ? " long" : ""}">${r.note}</span>` : "";
+    h += `<tr class="${empty ? "placeholder" : ""}">` +
+         `<td class="run">${label}${note}</td>`;
     r.values.forEach(v => {
       const s = paint(v);
       h += `<td class="${s ? "paint" : ""}" style="${s}">` +
@@ -151,3 +168,138 @@ function draw(){
 draw();
 </script></body></html>
 """
+
+
+def _seconds(value):
+    """Seconds from a number, or from a BIDS ``AcquisitionTime`` string."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    parts = text.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"cannot read a time from {value!r}")
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+
+def outlier_fractions(series, thresholds):
+    """``{measure: percent of frames over threshold}`` plus ``any``.
+
+    Every measure is put on one frame grid first. A per-transition measure --
+    framewise displacement, DVARS -- has one value fewer than a per-frame one,
+    and scoring each as it comes divides by different totals: the percentages
+    stop being comparable and a column can exceed the union that contains it.
+    A leading zero pads the short ones, which is the honest value there anyway
+    since no transition precedes the first frame.
+
+    Args:
+        series: ``{measure: 1-D array}``. A measure absent here, or empty, is
+            reported as None rather than as zero -- not measured and not
+            exceeded are different facts.
+        thresholds: ``{measure: value}``. Its order sets the column order.
+
+    Returns:
+        ``{measure: percent}`` in the order of ``thresholds``, then ``any``,
+        the union over the measures actually present.
+    """
+    import numpy as np
+
+    present = {k: np.asarray(v, dtype=np.float64).ravel()
+               for k, v in dict(series).items() if np.size(v)}
+    if not present:
+        return {**{k: None for k in thresholds}, "any": None}
+    n = max(v.size for v in present.values())
+
+    row, union = {}, np.zeros(n, dtype=bool)
+    for measure, threshold in dict(thresholds).items():
+        v = present.get(measure)
+        if v is None:
+            row[measure] = None
+            continue
+        if v.size == n - 1:
+            v = np.concatenate([[0.0], v])
+        if v.size != n:
+            row[measure] = None
+            continue
+        over = v > threshold
+        row[measure] = float(100.0 * over.mean())
+        union |= over
+    row["any"] = float(100.0 * union.mean())
+    return row
+
+
+def outlier_summary(runs, thresholds, out_html, *, acquisition=None,
+                    sessions=None, duration=None, gap_warn: float = 300.0,
+                    links=None, placeholders=(), **kwargs) -> Path:
+    """A coloured grid of how often each measure objects, one row per run.
+
+    Args:
+        runs: ``{label: {measure: series}}``.
+        thresholds: ``{measure: value}``, in the order the columns should read.
+        out_html: Where to write.
+        acquisition: ``{label: time}`` -- seconds, or a BIDS ``AcquisitionTime``
+            string. Given, the rows are ordered as they were acquired rather
+            than alphabetically, and each carries the gap since the one before.
+            A cohort reads differently in that order: drift, fatigue and the
+            run someone was repositioned before all show as a sequence.
+        sessions: ``{label: session}``. Acquisition times usually come from
+            BIDS ``AcquisitionTime``, which is a clock time with no date, so
+            ordering by it alone interleaves sessions that happened on
+            different days and invents gaps between them. Given this, rows are
+            ordered within a session and sessions keep the order they first
+            appear here; a gap is only ever measured between two runs of the
+            same session.
+        duration: ``{label: seconds}``. With it a gap is the real dead time
+            between one run ending and the next starting; without it, the
+            interval between starts, which is the same thing plus a run.
+        gap_warn: Seconds after which a gap is called out. A long one is where
+            the subject was spoken to, repositioned, or left alone -- and
+            wherever a field map sits far from what it corrects.
+        links: ``{label: url}`` to make a row clickable.
+        placeholders: Labels to show as rows with no measures -- field maps and
+            anatomicals, which have no frames to score but do have a place in
+            the order, and whose neighbours are what a reader wants to see.
+        **kwargs: Passed to :func:`summary_table`.
+
+    Returns:
+        The path written.
+    """
+    runs = {str(k): dict(v) for k, v in dict(runs).items()}
+    for label in placeholders:
+        runs.setdefault(str(label), {})
+
+    table = {label: outlier_fractions(series, thresholds)
+             for label, series in runs.items()}
+
+    times = {k: _seconds(v) for k, v in dict(acquisition or {}).items()}
+    notes, marks = {}, {}
+    if times:
+        groups = {k: str(v) for k, v in dict(sessions or {}).items()}
+        rank = {}
+        for label in table:                     # first appearance sets the order
+            rank.setdefault(groups.get(label, ""), len(rank))
+
+        def key(label):
+            t = times.get(label)
+            return (rank[groups.get(label, "")], t is None, t if t is not None else 0.0)
+
+        ordered = sorted(table, key=key)
+        table = {k: table[k] for k in ordered}
+        last = {}                               # per session: (end time, label)
+        for label in ordered:
+            now, group = times.get(label), groups.get(label, "")
+            if now is not None and group in last:
+                gap = now - last[group]
+                notes[label] = _duration(gap)
+                marks[label] = gap > gap_warn
+            if now is not None:
+                last[group] = now + float((duration or {}).get(label, 0.0))
+    return summary_table(table, out_html, links=links, notes=notes, marks=marks,
+                         **kwargs)
+
+
+def _duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    minutes, rest = divmod(int(round(seconds)), 60)
+    return f"{minutes}m{rest:02d}s" if minutes else f"{rest}s"

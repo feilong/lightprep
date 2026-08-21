@@ -26,7 +26,8 @@ The identity check (are two sessions really the same head?) lives in
 
 from .surface import (DEFAULT_SURFACE, SurfaceQC, euler_number,
                       flag_outliers, surface_qc)
-from .table import SEVERE, QUIET, summary_table
+from .table import (SEVERE, QUIET, outlier_fractions, outlier_summary,
+                    summary_table)
 from .motion import (DEFAULT_CLIP, DEFAULT_DOWNSAMPLE, FD_RADIUS_MM,
                      brain_mask, dvars, find_niivue, framewise_displacement,
                      correlation_distance, frame_distance, masked_series,
@@ -36,7 +37,8 @@ from .motion import (DEFAULT_CLIP, DEFAULT_DOWNSAMPLE, FD_RADIUS_MM,
                      FD_THRESHOLD_MM,
                      trimmed_mean, serve)
 
-__all__ = ["motion_report", "summary_table", "serve", "dvars", "frame_distance",
+__all__ = ["motion_report", "summary_table", "outlier_summary",
+           "outlier_fractions", "serve", "dvars", "frame_distance",
            "masked_series", "correlation_distance",
            "relative_fd", "fd_outliers", "FD_THRESHOLD_MM",
            "brain_mask", "quality_index", "aqi_outliers", "AQI_MAD",
