@@ -857,7 +857,7 @@ def _as_traces(fd) -> dict:
 
 def motion_report(volumes, out_html, *, fd=None, title: str = "motion QC",
                   subtitle: str = "", dvars_traces=None, distance=None,
-                  outliers=None, distance_max: float | None = 0.05,
+                  outliers=None, distance_max: float | None = None,
                   panels=None,
                   surfaces=None, mesh_thickness_mm: float = 1.0,
                   contours=None, niivue_js=None,
@@ -878,9 +878,15 @@ def motion_report(volumes, out_html, *, fd=None, title: str = "motion QC",
             ``.values``) or :func:`frame_distance`. Drawn in a third panel. It
             has one value per frame where FD and DVARS have one per
             transition; the page aligns them.
-        distance_max: Fixed y-axis top for the distance panel. Autoscaling
-            it is useless -- one corrupted frame at 0.2 flattens the 0.01
-            range everything else lives in. ``None`` to autoscale anyway.
+        distance_max: Fixed y-axis top for the distance panel, overriding the
+            usual scaling. It used to default to 0.05, because the axis was
+            once set by the maximum and one corrupted frame at 0.2 would
+            flatten the 0.01 range everything else lives in. The panel now
+            scales to a high quantile, which fixes that at the source, and the
+            fixed ceiling had become the worst offender on the page -- across a
+            59-run cohort the trace occupied a median 10% of its height, and
+            under 20% in 46 of them. Left None unless a run really must be read
+            against a fixed scale.
         surfaces: ``{label: path}`` of GIfTI meshes to draw over every viewer,
             or a list of paths. In the 2D slice views NiiVue draws a mesh as
             its intersection with the slice, so a white and a pial surface come
