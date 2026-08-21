@@ -1328,17 +1328,36 @@ function panel(host, traces, name, thr, ymax){
   const labels = Object.keys(traces);
   if (!labels.length) return;
   nPts = Math.max(nPts, ...labels.map(k => traces[k].length));
-  // A fixed top where one is given: autoscaling lets a single bad frame
-  // flatten the range the rest of the run lives in.
-  const maxY = ymax != null ? ymax
-    : Math.max(thr*1.4, ...labels.map(k => Math.max(...traces[k])));
+  // Two different ways a trace ends up a flat line at the bottom, and the axis
+  // has to dodge both. Scaling to the maximum lets one bad frame squash the
+  // range the rest of the run lives in; scaling to the threshold does the same
+  // whenever the run never goes near it. So: a high quantile rather than the
+  // max, and the threshold only gets a say when the data come within reach of
+  // it.
+  const all = labels.flatMap(k => traces[k]).filter(v => Number.isFinite(v));
+  const sorted = all.slice().sort((a, b) => a - b);
+  const q = f => sorted.length ? sorted[Math.floor(f*(sorted.length-1))] : 0;
+  const robust = Math.max(q(0.995), 1e-9);
+  // The threshold may stretch the axis, but only so far: past twice the
+  // robust maximum it is buying a dashed line at the cost of the trace, and a
+  // run nowhere near its limit is better read on its own scale. Capping rather
+  // than switching keeps this smooth -- no cliff where one frame changes the
+  // axis by a factor.
+  let maxY;
+  if (ymax != null) maxY = ymax;
+  else if (thr == null) maxY = robust*1.3;
+  else maxY = Math.max(robust*1.15, Math.min(thr*1.15, robust*2.0));
+  const trueMax = sorted.length ? sorted[sorted.length-1] : 0;
+  const clipped = trueMax > maxY*1.001;
   const D_ = traces, maxFD = maxY;
   const x = i => PAD.l + i*(plotW-PAD.l-PAD.r)/Math.max(1,D.nFrames-2);
   const y = v => plotH-PAD.b -
         (Math.min(v, maxFD)/maxFD)*(plotH-PAD.t-PAD.b);   // clamp to the top
   let s = `<svg viewBox="0 0 ${plotW} ${plotH}" preserveAspectRatio="none"
            class="trace">`;
-  s += `<text x="${PAD.l}" y="11" fill="#8b949e" font-size="11">${name}</text>`;
+  s += `<text x="${PAD.l}" y="11" fill="#8b949e" font-size="11">${name}` +
+       (clipped ? ` <tspan fill="#f0883e">peaks ${fmt(trueMax)}</tspan>` : "") +
+       `</text>`;
   // Marked where THIS measure exceeds ITS OWN threshold. Shading one panel
   // with another's verdict says a frame is bad here when it is bad elsewhere,
   // which is the opposite of what a per-measure panel is for -- the whole
@@ -1354,10 +1373,12 @@ function panel(host, traces, name, thr, ymax){
   }
   s += `<line x1="${PAD.l}" y1="${y(0)}" x2="${plotW-PAD.r}" y2="${y(0)}"
         stroke="#2a313c"/>`;
-  s += `<line x1="${PAD.l}" y1="${y(thr)}" x2="${plotW-PAD.r}"
-        y2="${y(thr)}" stroke="#f0883e" stroke-dasharray="4 4"
-        opacity=".7"/>`;
-  s += `<text x="4" y="${y(thr)+4}" fill="#8b949e" font-size="11">${thr}</text>`;
+  if (thr != null && thr <= maxY) {
+    s += `<line x1="${PAD.l}" y1="${y(thr)}" x2="${plotW-PAD.r}"
+          y2="${y(thr)}" stroke="#f0883e" stroke-dasharray="4 4"
+          opacity=".7"/>`;
+    s += `<text x="4" y="${y(thr)+4}" fill="#8b949e" font-size="11">${thr}</text>`;
+  }
   s += `<text x="4" y="${y(maxFD)+9}" fill="#8b949e" font-size="11">
         ${maxFD < 0.1 ? maxFD : maxFD.toFixed(1)}</text>`;
   labels.forEach((k,i) => {
