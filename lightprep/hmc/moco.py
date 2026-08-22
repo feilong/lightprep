@@ -503,6 +503,32 @@ def pose_distance(pull_a, pull_b, centroid, moment, count) -> float:
     return float(np.sqrt(max(squared, 0.0)))
 
 
+def pose_components(pull_a, pull_b, centroid, moment, count):
+    """Split :func:`pose_distance` into its rotation and translation halves.
+
+    ``D^2`` above is a sum of two independent terms, and they are not
+    interchangeable for every purpose. Susceptibility distortion is the case
+    that forces the distinction: the field depends on how the head sits in
+    B0, so rotating the head changes the field itself, while translating it
+    mostly carries the same field along. Two poses an equal number of
+    millimetres apart are therefore not equally damaging to a field map -- the
+    rotated one is worse, and a single RMS number hides which it was.
+
+    Returns:
+        ``(rotation mm, translation mm, angle degrees)``. The first two are
+        the two terms of ``D^2``, so ``hypot`` of them is
+        :func:`pose_distance`. The angle is the rotation between the poses,
+        independent of the brain's shape, for comparing with a specification.
+    """
+    a, b = np.asarray(pull_a, dtype=np.float64), np.asarray(pull_b, dtype=np.float64)
+    rot = np.trace(a[:3, :3] @ moment @ b[:3, :3].T)
+    spin = np.sqrt(max((2.0 * np.trace(moment) - 2.0 * rot) / count, 0.0))
+    gap = (a[:3, :3] @ centroid + a[:3, 3]) - (b[:3, :3] @ centroid + b[:3, 3])
+    relative = a[:3, :3].T @ b[:3, :3]
+    angle = np.degrees(np.arccos(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)))
+    return float(spin), float(np.linalg.norm(gap)), float(angle)
+
+
 def frechet_mean_pose(pulls, centroid, moment, weights=None) -> np.ndarray:
     """The rigid pose minimising total squared tissue displacement, in closed form.
 
