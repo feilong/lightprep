@@ -97,6 +97,7 @@ def pepolar(
     register: bool = False,
     cost: str = "corratio",
     dof: int = 6,
+    frames=None,
     max_frames: int = 5,
     keep_workdir: bool = False,
 ) -> SDCResult:
@@ -138,6 +139,14 @@ def pepolar(
         cost: FLIRT cost function, used only when ``register``.
         dof: FLIRT degrees of freedom, used only when ``register``. 6 (rigid)
             is what a within-session fieldmap warrants.
+        frames: Which frames of ``epi`` to use, as indices. The default takes
+            the first ``max_frames``, which is the earliest the run offers and
+            so the closest in time to a field map acquired before it. Pass
+            indices to choose on some other ground -- head position being the
+            one that matters, since a blip pair estimated across a pose
+            difference asks topup to explain a rigid displacement as a field.
+            ``opposite`` is always taken from the front: it is seconds long,
+            with nothing to choose between its frames.
         max_frames: Frames to take from each input. topup's cost is per frame
             and the field it solves for is static, so a handful of volumes per
             polarity buys everything more would. ``0`` means all of them.
@@ -193,7 +202,19 @@ def pepolar(
             f"{epi.name} and {opposite.name} share a shape but not an affine; "
             f"they are not the same prescription"
         )
-    if max_frames:
+    if frames is not None:
+        picked = np.asarray(frames, dtype=int)
+        if picked.ndim != 1 or picked.size == 0:
+            raise ValueError(f"frames must be a non-empty 1-D index array, got {frames!r}")
+        if picked.min() < 0 or picked.max() >= up.shape[3]:
+            raise ValueError(
+                f"frames index {picked.min()}..{picked.max()} outside "
+                f"{epi.name}'s {up.shape[3]} frames"
+            )
+        up = up[..., picked]
+        if max_frames:
+            down = down[..., :max_frames]
+    elif max_frames:
         up = up[..., :max_frames]
         down = down[..., :max_frames]
 

@@ -12,6 +12,10 @@ single-echo run whose only fieldmap is a reversed-phase-encoding EPI: it needs
 no phase at all, recovering the field from the blip-up/blip-down pair with FSL
 ``topup``.
 
+:func:`transport` is not a method but a companion to the static ones: a
+reference-space field is indexed by the head position it was estimated at, and
+this carries it onto another run's reference before that run is resampled.
+
 The default is :func:`medic_niimath`: it needs nothing installed and takes 21
 seconds on the pilot's 138-frame run where warpkit takes minutes, and the two
 agree to r=0.954 on the native field map. warpkit is still marginally the more
@@ -32,6 +36,7 @@ from .medic import MIN_ECHOES, medic
 from .niimath import medic as medic_niimath
 from .pepolar import pepolar
 from .phasediff import phasediff
+from .transport import transport
 
 #: Method name -> callable. Extend this as methods are added.
 METHODS = {
@@ -61,4 +66,5 @@ def get_method(name: str | None = None):
 
 
 __all__ = ["SDCResult", "medic", "medic_niimath", "pepolar", "phasediff",
-           "MIN_ECHOES", "METHODS", "DEFAULT_METHOD", "get_method"]
+           "transport", "MIN_ECHOES", "METHODS", "DEFAULT_METHOD",
+           "get_method"]
